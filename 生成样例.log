@@ -1,0 +1,58 @@
+Creating Table: CREATE TABLE table_0 (id INT AUTO_INCREMENT PRIMARY KEY, col_0 TEXT, col_1 DOUBLE, col_2 TEXT, col_3 FLOAT)
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'kxhtc', 81.97, 'ujskl', 51.72)
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'tglmr', 81.34, 'nqkwl', 86.23)    
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'owbmv', 36.04, 'tsien', 11.08)
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'vzeoy', 54.69, 'dhixy', 18.96)    
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'puomj', 40.07, 'cblzr', 43.37)    
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'choko', 31.58, 'tdtmd', 12.61)    
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'wfouc', 62.77, 'rlnsb', 21.96)    
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'llojp', 73.1, 'khmgp', 10.5)      
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'ipmqj', 36.43, 'scnci', 38.06)
+Inserting Data: INSERT INTO table_0 (id, col_0, col_1, col_2, col_3) VALUES (NULL, 'jxndk', 63.03, 'oxwsk', 82.01)    
+Executing: UPDATE table_0 SET col_2 = 'reyvm' WHERE col_0 = 'bpbtq'
+Executing: ALTER TABLE table_0 DROP COLUMN col_0
+table table_0 has 10 rows
+是否存在交集：
+False
+初始化资源分布：
+{'trx1_lock_row_ids': [2, 3, 4], 'trx2_lock_row_ids': [5, 6, 7, 8, 9], 'intersection_row_ids': []}
+T1是否连续：
+True
+T2是否连续：
+True
+事务1锁定的行ID：
+[2, 3, 4]
+事务2锁定的行ID：
+[5, 6, 7, 8, 9]
+交集行ID：
+[]
+事务1独占行：
+[2, 3, 4]
+事务2独占行：
+[5, 6, 7, 8, 9]
+non intersection phase1
+Generating lock SQL with params: template_key=range but use range, lock_level=row, lock_type=X, row_idx=2, is_continuous=True, range_end_idx=4
+Generating lock SQL with params: template_key=range but use range, lock_level=row, lock_type=X, row_idx=5, is_continuous=True, range_end_idx=9
+non intersection phase1 end
+
+non intersection phase2
+Generating lock SQL with params: template_key=range but use range, lock_level=row, lock_type=S, row_idx=5, is_continuous=True, range_end_idx=7
+Generating lock SQL with params: template_key=range but use range, lock_level=row, lock_type=II, row_idx=3, is_continuous=True, range_end_idx=4
+non intersection phase2 end
+
+START TRANSACTION
+SELECT id FROM table_0 WHERE id BETWEEN 2 AND 4 FOR UPDATE
+SELECT id FROM table_0 WHERE id BETWEEN 5 AND 7 LOCK IN SHARE MODE
+COMMIT;
+
+START TRANSACTION
+SELECT id, col_3 FROM table_0 WHERE id BETWEEN 5 AND 9 FOR UPDATE
+INSERT INTO table_0 (col_2) VALUES ('EFtJabrh')
+COMMIT;
+
+(2, 'SELECT id, col_3 FROM table_0 WHERE id BETWEEN 5 AND 9 FOR UPDATE')
+(1, 'SELECT id FROM table_0 WHERE id BETWEEN 2 AND 4 FOR UPDATE')
+(1, 'SELECT id FROM table_0 WHERE id BETWEEN 5 AND 7 LOCK IN SHARE MODE')
+(2, "INSERT INTO table_0 (col_2) VALUES ('EFtJabrh')")
+(1, 'COMMIT')
+(2, 'COMMIT')

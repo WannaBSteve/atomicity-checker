@@ -1,0 +1,11 @@
+Bug Info: 死锁发生，事务2被回滚，但最终状态与事务1单独执行的结果不一致，不满足原子性
+Resource Distribution: {'trx1_lock_row_ids': [5, 6, 8], 'trx2_lock_row_ids': [2, 7], 'intersection_row_ids': []}
+Lock Same Resource: False
+T1 Continuous: False
+T2 Continuous: False
+T1 Lock Row IDs: [5, 6, 8]
+T2 Lock Row IDs: [2, 7]
+Intersection IDs: []
+T1 Exclusive IDs: [5, 6, 8]
+T2 Exclusive IDs: [2, 7]
+Snapshots: {'before': {'table_0': [(1, 'lrhsr', 'qqqhc', 'ufmdy', None), (2, 'hhqgt', 'guqrp', 'obqry', None), (3, 'ljwnq', 'outtd', 'bpyew', None), (4, 'lenwm', 'ukqhh', 'nenaf', None), (5, 'lopiy', 'nrnuu', 'hpfcg', None), (6, 'idxnk', 'gjqcf', 'kvlgh', None), (7, 'nfuhz', 'jmtye', 'qjphf', None), (8, 'unzbk', 'dpxdb', 'gdide', None)]}, 'trx1': {'table_0': [(1, 'lrhsr', 'qqqhc', 'ufmdy', None), (2, 'hhqgt', 'guqrp', 'obqry', None), (3, 'ljwnq', 'outtd', 'bpyew', None), (4, 'lenwm', 'ukqhh', 'nenaf', None), (5, 'lopiy', 'nrnuu', 'hpfcg', None), (6, 'idxnk', 'gjqcf', 'kvlgh', None), (7, 'nfuhz', 'jmtye', 'qjphf', None), (8, 'unzbk', 'dpxdb', 'gdide', None), (9, 'irutA', 'TWHAK', 'BgPBG', 68), (10, 'wZjQw', 'UvGES', 'zBqBR', 71), (11, 'nQFnI', 'aMWZu', 'dCKuV', 54)]}, 'trx2': {'table_0': [(1, 'lrhsr', 'qqqhc', 'ufmdy', None), (2, 'hhqgt', 'guqrp', 'obqry', None), (3, 'ljwnq', 'outtd', 'bpyew', None), (4, 'lenwm', 'ukqhh', 'nenaf', None), (5, 'lopiy', 'nrnuu', 'hpfcg', None), (6, 'idxnk', 'gjqcf', 'kvlgh', None), (7, 'nfuhz', 'jmtye', 'qjphf', None), (8, 'unzbk', 'dpxdb', 'gdide', None)]}, 'serial': {'table_0': [(1, 'lrhsr', 'qqqhc', 'ufmdy', None), (2, 'hhqgt', 'guqrp', 'obqry', None), (3, 'ljwnq', 'outtd', 'bpyew', None), (4, 'lenwm', 'ukqhh', 'nenaf', None), (5, 'lopiy', 'nrnuu', 'hpfcg', None), (6, 'idxnk', 'gjqcf', 'kvlgh', None), (7, 'nfuhz', 'jmtye', 'qjphf', None), (8, 'unzbk', 'dpxdb', 'gdide', None), (12, 'irutA', 'TWHAK', 'BgPBG', 68), (13, 'wZjQw', 'UvGES', 'zBqBR', 71), (14, 'nQFnI', 'aMWZu', 'dCKuV', 54)]}}
