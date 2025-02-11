@@ -34,9 +34,10 @@ class MySQLInitializer:
 
     def _generate_create_table_sql(self, table_name):
         """生成随机建表SQL"""
-        num_columns = random.randint(2, 5)  # 每个表随机列数
+        num_columns = random.randint(2, 10)  # 每个表随机列数
         # 确保id列为主键和AUTO_INCREMENT
-        column_definitions = ["id INT AUTO_INCREMENT PRIMARY KEY"]
+        column_definitions = ["id INT AUTO_INCREMENT","col_gap INT DEFAULT NULL"]
+        key_definitions = ["PRIMARY KEY (`id`)","KEY `gap` (`col_gap`)"]
         column_types = ["INT", "VARCHAR(255)", "FLOAT", "DOUBLE", "TEXT"]
 
         for i in range(num_columns):
@@ -45,13 +46,14 @@ class MySQLInitializer:
             column_definitions.append(f"{column_name} {column_type}")
 
         columns_sql = ", ".join(column_definitions)
-        return f"CREATE TABLE {table_name} ({columns_sql})"
+        key_sql = ",".join(key_definitions)
+        sql = columns_sql + "," + key_sql
+        return f"CREATE TABLE {table_name} ({sql})"
 
 
     def populate_tables(self):
         """随机向每个表插入数据"""
-        # self.cursor.execute("SHOW TABLES")
-        # tables = [row[0] for row in self.cursor.fetchall()]
+
         tables = ["table_0"]
         for table in tables:
             num_inserts = random.randint(5, self.max_inserts_per_table)
