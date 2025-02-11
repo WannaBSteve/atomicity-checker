@@ -36,17 +36,35 @@ class MySQLInitializer:
         """生成随机建表SQL"""
         num_columns = random.randint(2, 10)  # 每个表随机列数
         # 确保id列为主键和AUTO_INCREMENT
-        column_definitions = ["id INT AUTO_INCREMENT","col_gap INT DEFAULT NULL"]
-        key_definitions = ["PRIMARY KEY (`id`)","KEY `gap` (`col_gap`)"]
+        column_definitions = ["id INT AUTO_INCREMENT", "col_gap INT DEFAULT NULL"]
+        key_definitions = ["PRIMARY KEY (`id`)", "KEY `gap` (`col_gap`)"]
         column_types = ["INT", "VARCHAR(255)", "FLOAT", "DOUBLE", "TEXT"]
-
+        
+        # 存储所有可以作为键的列名（不包括TEXT类型的列）
+        key_candidate_columns = []
+        
+        # 生成普通列
         for i in range(num_columns):
             column_name = f"col_{i}"
             column_type = random.choice(column_types)
             column_definitions.append(f"{column_name} {column_type}")
+            # TEXT类型不适合作为键，所以只收集非TEXT类型的列
+            if column_type != "TEXT":
+                key_candidate_columns.append(column_name)
+        
+        # 随机决定要创建多少个额外的键（0到2个）
+        if key_candidate_columns:  # 确保有可用的列来创建键
+            num_extra_keys = random.randint(0, min(2, len(key_candidate_columns)))
+            # 随机选择列创建键
+            for _ in range(num_extra_keys):
+                if key_candidate_columns:  # 确保还有可用的列
+                    key_column = random.choice(key_candidate_columns)
+                    key_candidate_columns.remove(key_column)  # 避免重复使用同一列
+                    key_name = f"key_{key_column}"
+                    key_definitions.append(f"KEY `{key_name}` (`{key_column}`)")
 
         columns_sql = ", ".join(column_definitions)
-        key_sql = ",".join(key_definitions)
+        key_sql = ", ".join(key_definitions)
         sql = columns_sql + "," + key_sql
         return f"CREATE TABLE {table_name} ({sql})"
 
