@@ -80,15 +80,16 @@ LOCK_TEMPLATES = {
     "GAP": {  # 间隙锁
         "basic": "SELECT {select_cols} FROM {table} WHERE {gap_lock_cond} FOR UPDATE",
         "range": "SELECT {select_cols} FROM {table} WHERE id BETWEEN {v1} AND {v2} FOR UPDATE",
-        "insert": "INSERT INTO {table} ({insert_cols}) VALUES ({vals}) WHERE NOT EXISTS (SELECT 1 FROM {table} WHERE {gap_lock_cond})"
+        "insert": "INSERT INTO {table} ({insert_cols}) VALUES ({insert_vals})"
     },
     "NK": {  # 临键锁
         "range": "SELECT {select_cols} FROM {table} WHERE id >= {v1} AND id <= {v2} FOR UPDATE",
-        "insert": "INSERT INTO {table} ({insert_cols}) VALUES ({vals}) WHERE {nk_lock_cond}"
+        "insert": "INSERT INTO {table} ({insert_cols}) VALUES ({insert_vals})"
     },
     "II": {  # 插入意向锁
-        "basic": "INSERT INTO {table} ({insert_cols}) VALUES ({vals})",
-        "insert": "INSERT INTO {table} ({insert_cols}) VALUES ({vals}) ON DUPLICATE KEY UPDATE {update_expr}"
+        "basic": "INSERT INTO {table} ({insert_cols}) VALUES ({insert_vals})",
+        "insert": "INSERT INTO {table} ({insert_cols}) VALUES ({insert_vals}) ON DUPLICATE KEY UPDATE {update_expr}",
+        "range": "SELECT {select_cols} FROM {table} WHERE id BETWEEN {v1} AND {v2} FOR UPDATE"
     },
     # 表级锁模板 (table level)
     "TR": {  # 表读锁
@@ -386,26 +387,24 @@ class DeadlockGenerator:
                          is_continuous: bool = False, 
                          range_end_idx: int = None) -> str:
         """统一的SQL生成方法"""
-        try:
-            if template_key == "insert":
-                return self._generate_insert_lock_sql(lock_type)
-            
+        try:            
             column_names, column_types, primary_keys = self._get_table_metadata()
             template = self.lock_templates[lock_level][lock_type][template_key]
             if is_continuous:
                 # 对于连续锁定行，先只使用range作为key，后续再扩展less eq等等
-                template = self.lock_templates[lock_level][lock_type]['range']
-                print(f"Generating lock SQL with params: template_key={template_key} but use range, "
+                # template = self.lock_templates[lock_level][lock_type]['range']
+                print(f"Generating lock SQL with params: template_key={template_key}, "
                             f"lock_level={lock_level}, lock_type={lock_type}, "
                             f"row_idx={row_idx}, is_continuous={is_continuous}, "
                             f"range_end_idx={range_end_idx}")
-                logger.info(f"Generating lock SQL with params: template_key={template_key} but use range, "
+                logger.info(f"Generating lock SQL with params: template_key={template_key}, "
                             f"lock_level={lock_level}, lock_type={lock_type}, "
                             f"row_idx={row_idx}, is_continuous={is_continuous}, "
                             f"range_end_idx={range_end_idx}")
                 return self._generate_continuous_lock_sql(
                     template, column_names, column_types, 
-                    primary_keys, row_idx, range_end_idx
+                    primary_keys, row_idx, range_end_idx,
+                    lock_level, lock_type, template_key
                 )
             else:
                 print(f"Generating lock SQL with params: template_key={template_key}, "
@@ -418,7 +417,7 @@ class DeadlockGenerator:
                             f"range_end_idx={range_end_idx}")
                 return self._generate_discrete_lock_sql(
                     template, column_names, column_types, 
-                    primary_keys, row_idx
+                    primary_keys, row_idx,lock_level,lock_type,template_key
                 )
         except Exception as e:
             logger.error(f"生成锁SQL失败: {e}")
@@ -429,7 +428,10 @@ class DeadlockGenerator:
                                column_types: List[str],
                                primary_keys: List[str], 
                                start_idx: int, 
-                               end_idx: int) -> str:
+                               end_idx: int,
+                               lock_level: str,
+                               lock_type: str,
+                               template_key: str) -> str:
         """生成连续锁定的SQL"""
         try:
             # 获取范围内的所有行
@@ -439,7 +441,8 @@ class DeadlockGenerator:
             rows = self.cursor1.fetchall()
             row_nums = len(rows)
             if not rows:
-                raise ValueError(f"找不到从{start_idx}到{end_idx}的行")
+                logger.info(f"找不到从{start_idx}到{end_idx}的行,当前事务没有独占行")
+                return None
             
             
             # 创建SQL参数生成器 - 使用所有列而不是selected_columns
@@ -448,7 +451,8 @@ class DeadlockGenerator:
                 column_names,  # 使用所有列名
                 column_types,  # 使用所有列类型
                 primary_keys,
-                rows
+                rows,
+                lock_type
             )
             
             # 获取模板需要的参数
@@ -460,13 +464,14 @@ class DeadlockGenerator:
             logger.info(f"needed_params: {needed_params}")
             logger.info(f"params: {params}")
 
-            # 处理范围查询的特殊参数
-            if 'v1' in needed_params:
-                params['v1'] = str(start_idx)
-            if 'v2' in needed_params:
-                params['v2'] = str(end_idx)
-            if 'col' in needed_params:
-                params['col'] = 'id'  # 使用id列作为范围查询的列
+            if lock_type != "GAP" and lock_type != "II" and lock_type != "NK":
+                # 处理范围查询的特殊参数
+                if 'v1' in needed_params:
+                    params['v1'] = str(start_idx)
+                if 'v2' in needed_params:
+                    params['v2'] = str(end_idx)
+                if 'col' in needed_params:
+                    params['col'] = 'id'  # 使用id列作为范围查询的列
             
             return template.format(**params)
             
@@ -478,7 +483,10 @@ class DeadlockGenerator:
                                  column_names: List[str], 
                                  column_types: List[str],
                                  primary_keys: List[str], 
-                                 row_idx: int) -> str:
+                                 row_idx: int,
+                                 lock_level:str,
+                                 lock_type:str,
+                                 template_key:str) -> str:
         """生成离散锁定的SQL，使用参数生成器实现动态参数"""
         try:
             # 获取指定行
@@ -487,15 +495,17 @@ class DeadlockGenerator:
             )
             rows = self.cursor1.fetchall()
             if len(rows) == 0:
-                raise ValueError(f"找不到索引为{row_idx}的行")
-            
+                logger.info(f"找不到索引为{row_idx}的行")
+                return None
+
             # 创建SQL参数生成器
             param_generator = SQLParamGenerator(
                 self.table_name,
                 column_names,
                 column_types,
                 primary_keys,
-                rows
+                rows,
+                lock_type
             )
             
             # 获取模板需要的参数
@@ -1431,86 +1441,18 @@ class DeadlockGenerator:
             logger.error("")
             raise
 
-    def _generate_insert_lock_sql(self, lock_type: str, template_key: str = "insert") -> str:
-        """生成带锁的INSERT语句"""
-        try:
-            # 获取表的元数据信息
-            column_names, column_types, primary_keys = self._get_table_metadata()
-            template = self.lock_templates[lock_type][template_key]
-            
-            # 创建SQL参数生成器
-            param_generator = SQLParamGenerator(
-                self.table_name,
-                column_names,
-                column_types,
-                primary_keys,
-                self.rows
-            )
-            
-            # 获取col_gap列的所有值并排序
-            col_gap_values = sorted([row[1] for row in self.rows])
-            
-            # 根据锁类型选择插入值的策略
-            if lock_type == "GAP":
-                # 在两个已存在值之间的gap中插入，会获取gap锁
-                if len(col_gap_values) >= 2:
-                    for i in range(len(col_gap_values) - 1):
-                        if col_gap_values[i + 1] - col_gap_values[i] > 1:
-                            insert_value = col_gap_values[i] + 1
-                            break
-                    else:
-                        insert_value = col_gap_values[-1] + 1
-                else:
-                    insert_value = 1 if not col_gap_values else col_gap_values[0] + 1
-                    
-            elif lock_type == "NK":
-                # 插入一个等于某个已存在值的记录，会获取next-key锁
-                insert_value = random.choice(col_gap_values) if col_gap_values else 1
-                
-            elif lock_type == "II":
-                # 插入一个已存在的值，触发ON DUPLICATE KEY UPDATE，获取插入意向锁
-                insert_value = random.choice(col_gap_values) if col_gap_values else 1
-                
-            # 获取模板需要的基本参数
-            needed_params = _extract_template_params(template)
-            params = param_generator.generate_params(needed_params)
-            
-            # 修改生成的vals参数，确保col_gap列使用我们选择的值
-            vals_list = params['vals'].split(',')
-            vals_list[1] = str(insert_value)  # 假设col_gap是第二列
-            params['vals'] = ','.join(vals_list)
-            
-            # 对于II锁，添加ON DUPLICATE KEY UPDATE子句
-            if lock_type == "II":
-                update_cols = [col for col in column_names if col not in primary_keys and col != 'id']
-                update_exprs = []
-                for col in update_cols:
-                    new_val = param_generator._generate_value_by_type(
-                        column_types[column_names.index(col)]
-                    )
-                    update_exprs.append(f"{col}={new_val}")
-                params['update_expr'] = ','.join(update_exprs)
-
-            print(f"Generated INSERT lock SQL params: {params}")
-            logger.info(f"Generated INSERT lock SQL params: {params}")
-            
-            return template.format(**params)
-            
-        except Exception as e:
-            logger.error(f"生成INSERT锁SQL失败: {e}")
-            raise
-
 class SQLParamGenerator:
     """SQL参数生成器"""
     def __init__(self, table_name: str, column_names: List[str], 
                 column_types: List[str], primary_keys: List[str], 
-                rows: List[tuple]):
+                rows: List[tuple],lock_type:str):
         self.table_name = table_name
         self.column_names = column_names
         self.column_types = column_types
         self.primary_keys = primary_keys
         self.rows = rows
-        
+        self.lock_type = lock_type
+
         # 缓存随机选择的列及其类型
         self._current_random_column = None
         self._current_column_type = None
@@ -1521,8 +1463,8 @@ class SQLParamGenerator:
         self.param_generators = {
             "table": lambda: self.table_name,
             "select_cols": lambda: self._generate_select_columns(),
-            "insert_cols": lambda: self._generate_insert_columns(),
             "cond": lambda: self._generate_condition(),
+            "insert_cols": lambda: self._generate_insert_columns(),
             "gap_lock_cond": lambda: self._generate_gap_lock_condition(),
             "col": lambda: self._get_random_column(),  # 返回列名
             "idx": lambda: f"idx_{random.choice(self.column_names)}",
@@ -1530,7 +1472,9 @@ class SQLParamGenerator:
             "v1": lambda: self._format_value(self.rows[0][self.column_names.index(self._get_default_column())]),
             "v2": lambda: self._format_value(self.rows[-1][self.column_names.index(self._get_default_column())]),
             "vals": lambda: self._generate_values(),
-            "val": lambda: self._generate_random_value()  # 返回与列类型匹配的值
+            "val": lambda: self._generate_random_value(),
+            "insert_vals": lambda: self._generate_insert_values(self.lock_type),  # 新增
+            "update_expr": lambda: self._generate_update_expression()  # 新增
         }
 
     def _get_random_column(self) -> str:
@@ -1866,6 +1810,82 @@ class SQLParamGenerator:
         except Exception as e:
             logger.error(f"生成VALUES表达式失败: {e}")
             logger.error("")
+            raise
+
+    def _generate_insert_values(self, lock_type: str) -> str:
+        """生成INSERT语句的VALUES部分"""
+        try:
+            # 获取col_gap列的值
+            col_gap_values = sorted([row[1] for row in self.rows])  # 假设col_gap是第二列
+            
+            # 根据锁类型选择插入值
+            if lock_type == "GAP":
+                # 找出所有可用的gap
+                gaps = []
+                if len(col_gap_values) >= 2:
+                    for i in range(len(col_gap_values) - 1):
+                        if col_gap_values[i + 1] - col_gap_values[i] > 1:
+                            gaps.append((col_gap_values[i], col_gap_values[i + 1]))
+                            
+                # 随机打乱gaps的顺序
+                random.shuffle(gaps)
+                
+                # 遍历所有gap直到找到合适的值
+                insert_value = None
+                for start_val, end_val in gaps:
+                    insert_value = random.randint(start_val + 1, end_val - 1)
+                    break  # 找到第一个合适的值就停止
+                    
+                # 如果没有找到合适的gap，在最大值之后插入
+                if insert_value is None:
+                    insert_value = col_gap_values[-1] + 1 if col_gap_values else 1
+                    
+            elif lock_type == "NK":
+                # Next-Key Lock需要在已有值之前的gap中插入
+                # 随机选择一个已有值，在它之前的gap中插入
+                if col_gap_values:
+                    target_value = random.choice(col_gap_values)
+                    target_idx = col_gap_values.index(target_value)
+                    if target_idx > 0:
+                        # 在选中值和它前一个值之间插入
+                        insert_value = random.randint(col_gap_values[target_idx-1] + 1, target_value - 1)
+                    else:
+                        # 如果是第一个值，在它之前插入
+                        insert_value = target_value - 1 if target_value > 1 else 1
+                else:
+                    insert_value = 1
+            
+            elif lock_type == "II":
+                # Insert Intention Lock需要插入一个会导致唯一键冲突的值
+                if col_gap_values:
+                    # 选择一个已有值直接插入，触发唯一键冲突
+                    insert_value = random.choice(col_gap_values)
+                else:
+                    insert_value = 1
+            
+            # 生成完整的VALUES部分
+            vals_list = self._generate_values().split(',')
+            vals_list[1] = str(insert_value)  # 假设col_gap是第二列
+            return ','.join(vals_list)
+            
+        except Exception as e:
+            logger.error(f"生成INSERT VALUES失败: {e}")
+            raise
+
+    def _generate_update_expression(self) -> str:
+        """生成UPDATE表达式"""
+        try:
+            update_cols = [col for col in self.column_names if col not in self.primary_keys and col != 'id']
+            update_exprs = []
+            for col in update_cols:
+                new_val = self._generate_value_by_type(
+                    self.column_types[self.column_names.index(col)]
+                )
+                update_exprs.append(f"{col}={new_val}")
+            return ','.join(update_exprs)
+            
+        except Exception as e:
+            logger.error(f"生成UPDATE表达式失败: {e}")
             raise
 
 def _extract_template_params(template: str) -> Set[str]:
