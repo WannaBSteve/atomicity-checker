@@ -885,7 +885,7 @@ class DeadlockGenerator:
                 lock_template_key = random.choice(list(self.lock_templates["row"][second_lock].keys()))
                 trx2_sql.append(self._generate_lock_sql(lock_template_key, "row", second_lock, row_id, False))
         
-        # 随机交错执行两个事务的语句
+        # 随机交错两个事务的语句组成序列
         while trx1_sql or trx2_sql:
             if not trx1_sql:
                 # 只剩T2的语句
@@ -919,8 +919,8 @@ class DeadlockGenerator:
         print("intersection phase2")
         logger.info("intersection phase2")
         # 为两个事务分别获取一对不兼容的锁
-        trx1_phase2_lock, trx1_phase3_lock = self._get_lock_pair(compatible=False)
-        trx2_phase2_lock, trx2_phase3_lock = self._get_lock_pair(compatible=False)
+        trx1_phase2_lock, trx2_phase3_lock = self._get_lock_pair(compatible=False)
+        trx2_phase2_lock, trx1_phase3_lock = self._get_lock_pair(compatible=False)
         
         print(f"事务1在第二阶段自己加的锁: {trx1_phase2_lock}")
         print(f"事务2在第二阶段自己加的锁: {trx2_phase2_lock}")
@@ -971,7 +971,6 @@ class DeadlockGenerator:
                                             row_id, False)
                 trx2_sql.append(sql)
         
-        # 随机交错执行两个事务的语句
         while trx1_sql or trx2_sql:
             if not trx1_sql:
                 # 只剩T2的语句
@@ -1143,7 +1142,6 @@ class DeadlockGenerator:
                                                 row_id, False)
                     trx2_sql.append(sql)
             
-            # 随机交错执行两个事务的语句
             while trx1_sql or trx2_sql:
                 if not trx1_sql:
                     # 只剩T2的语句
@@ -1267,16 +1265,63 @@ class DeadlockGenerator:
         return incompatible_pairs
 
     def _get_compatible_lock_pair(self, resource_type: str = "row") -> Tuple[str, str]:
-        """获取一对兼容的锁"""
+        """
+        获取一对兼容的锁，考虑锁的顺序性
+        
+        Args:
+            resource_type: 资源类型，默认为"row"
+            
+        Returns:
+            Tuple[str, str]: (first_lock, second_lock)，其中first_lock是先获取的锁，
+                            second_lock是后获取的锁，且second_lock与first_lock兼容
+        """
         if resource_type not in self.compatible_lock_pairs:
             raise ValueError(f"在{self.isolation_level}隔离级别下找不到{resource_type}资源的兼容锁对")
-        return random.choice(self.compatible_lock_pairs[resource_type])
+        
+        # 从可用的锁对中随机选择一对，但保持顺序
+        # 第一个锁是已持有的锁（矩阵的列），第二个锁是请求的锁（矩阵的行）
+        first_lock = random.choice(iso_lock_support[self.isolation_level][resource_type])
+        
+        # 找出所有与first_lock兼容的锁
+        compatible_second_locks = [
+            lock_type for lock_type in iso_lock_support[self.isolation_level][resource_type]
+            if row_lock_compatibility[lock_type][first_lock]  # 注意这里的顺序：[请求锁][已持有锁]
+        ]
+        
+        if not compatible_second_locks:
+            raise ValueError(f"找不到与{first_lock}兼容的锁")
+        
+        second_lock = random.choice(compatible_second_locks)
+        return first_lock, second_lock
 
     def _get_incompatible_lock_pair(self, resource_type: str = "row") -> Tuple[str, str]:
-        """获取一对不兼容的锁"""
+        """
+        获取一对不兼容的锁，考虑锁的顺序性
+        
+        Args:
+            resource_type: 资源类型，默认为"row"
+            
+        Returns:
+            Tuple[str, str]: (first_lock, second_lock)，其中first_lock是先获取的锁，
+                            second_lock是后获取的锁，且second_lock与first_lock不兼容
+        """
         if resource_type not in self.incompatible_lock_pairs:
             raise ValueError(f"在{self.isolation_level}隔离级别下找不到{resource_type}资源的不兼容锁对")
-        return random.choice(self.incompatible_lock_pairs[resource_type])
+        
+        # 从可用的锁中随机选择第一个锁
+        first_lock = random.choice(iso_lock_support[self.isolation_level][resource_type])
+        
+        # 找出所有与first_lock不兼容的锁
+        incompatible_second_locks = [
+            lock_type for lock_type in iso_lock_support[self.isolation_level][resource_type]
+            if not row_lock_compatibility[lock_type][first_lock]  # 注意这里的顺序：[请求锁][已持有锁]
+        ]
+        
+        if not incompatible_second_locks:
+            raise ValueError(f"找不到与{first_lock}不兼容的锁")
+        
+        second_lock = random.choice(incompatible_second_locks)
+        return first_lock, second_lock
 
     def _get_lock_pair(self, compatible: bool = True, resource_type: str = "row") -> Tuple[str, str]:
         """
@@ -2479,7 +2524,7 @@ except mysql.connector.Error as err:
     logger.warning(f"设置锁等待超时失败: {err}")
 
 # 进行实验
-num_of_runs = 1
+num_of_runs = 100
 logger.info("INFO TEST")
 logger.debug("DEBUG TEST")
 logger.error("ERROR TEST")
@@ -2567,6 +2612,7 @@ for i in range(num_of_runs):
             # 导出还原后的数据库状态
             dump_cmd = f"mysqldump -h localhost -P 3308 -u root -p123456 test > {bug_case_dir}/initial_state.sql"
             os.system(dump_cmd)
+
             
             # 保存事务和序列信息
             with open(f"{bug_case_dir}/transactions.sql", 'w') as f:
