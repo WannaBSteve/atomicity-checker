@@ -66,7 +66,7 @@ LOCK_TEMPLATES = {
     # 行级锁模板 (row level)
     "S": {  # 共享锁
         "basic": "SELECT {select_cols} FROM {table} WHERE {cond} LOCK IN SHARE MODE",
-        # "index": "SELECT {select_cols} FROM {table} FORCE INDEX({idx}) WHERE {cond} LOCK IN SHARE MODE",
+        "index": "SELECT {select_cols} FROM {table} FORCE INDEX({idx}) WHERE {cond} LOCK IN SHARE MODE",
         # "join": "SELECT {cols} FROM {table1} INNER JOIN {table2} ON {join_cond} WHERE {cond} LOCK IN SHARE MODE",
         "range": "SELECT {select_cols} FROM {table} WHERE id BETWEEN {v1} AND {v2} LOCK IN SHARE MODE"
     },
@@ -74,12 +74,13 @@ LOCK_TEMPLATES = {
         "basic": "SELECT {select_cols} FROM {table} WHERE {cond} FOR UPDATE",
         "update": "UPDATE {table} SET {set_expr} WHERE {cond}",
         "delete": "DELETE FROM {table} WHERE {cond}",
-        # "index": "SELECT {select_cols} FROM {table} FORCE INDEX({idx}) WHERE {cond} FOR UPDATE",
+        "index": "SELECT {select_cols} FROM {table} FORCE INDEX({idx}) WHERE {cond} FOR UPDATE",
         "range": "SELECT {select_cols} FROM {table} WHERE id BETWEEN {v1} AND {v2} FOR UPDATE" # TODO:range模板目前只支持id列
     },
     "GAP": {  # 间隙锁
         "basic": "SELECT {select_cols} FROM {table} WHERE {gap_lock_cond} FOR UPDATE",
         "range": "SELECT {select_cols} FROM {table} WHERE id BETWEEN {v1} AND {v2} FOR UPDATE",
+        "index": "SELECT {select_cols} FROM {table} FORCE INDEX({idx}) WHERE {gap_lock_cond} FOR UPDATE",
         "insert": "INSERT INTO {table} ({insert_cols}) VALUES ({insert_vals})"
     },
     "NK": {  # 临键锁
@@ -189,10 +190,10 @@ iso_lock_template = {
 row_lock_compatibility = {
     #        S      X      GAP    NK     II
     "S":  {"S": True,  "X": False, "GAP": True,  "NK": False, "II": True},   # 共享锁
-    "X":  {"S": False, "X": False, "GAP": True,  "NK": False, "II": True},  # 排他锁
+    "X":  {"S": False, "X": False, "GAP": True,  "NK": False, "II": True},   # 排他锁
     "GAP":{"S": True,  "X": True,  "GAP": True,  "NK": True,  "II": True},   # 间隙锁
-    "NK": {"S": False, "X": False, "GAP": True,  "NK": False, "II": True},  # Next-Key锁
-    "II": {"S": True,  "X": True, "GAP": False,  "NK": False, "II": True}    # 插入意向锁
+    "NK": {"S": False, "X": False, "GAP": True,  "NK": False, "II": True},   # Next-Key锁
+    "II": {"S": True,  "X": True,  "GAP": False, "NK": False, "II": False}   # 插入意向锁 - 修改这里，II锁之间互斥
 }
 
 # 表级锁的兼容性矩阵
@@ -266,14 +267,19 @@ class DeadlockGenerator:
        self.compatible_lock_pairs = self._init_compatible_lock_pairs()
        self.incompatible_lock_pairs = self._init_incompatible_lock_pairs()
     
-    def _get_table_metadata(self) -> Tuple[List[str], List[str], List[str]]:
-        """获取表的元数据信息"""
+    def _get_table_metadata(self) -> Tuple[List[str], List[str], List[str], List[str]]:
+        """获取表的元数据信息
+        
+        Returns:
+            Tuple[List[str], List[str], List[str], List[str]]: 返回(列名列表, 列类型列表, 主键列表, 索引名称列表)
+        """
         try:
-           # 获取列信息
+            # 获取列信息
             self.cursor1.execute(f"DESCRIBE {self.table_name}")
             columns = [(row[0], row[1]) for row in self.cursor1.fetchall()]
             column_names = [col[0] for col in columns]
             column_types = [col[1] for col in columns]
+            
             # 获取主键信息
             self.cursor1.execute(f"""
                 SELECT COLUMN_NAME 
@@ -285,10 +291,21 @@ class DeadlockGenerator:
             """)
             primary_keys = [row[0] for row in self.cursor1.fetchall()]
             
-            return column_names, column_types, primary_keys
+            # 获取索引信息
+            self.cursor1.execute(f"""
+                SELECT DISTINCT INDEX_NAME
+                FROM INFORMATION_SCHEMA.STATISTICS 
+                WHERE TABLE_SCHEMA = '{self.db.config['database']}'
+                    AND TABLE_NAME = '{self.table_name}'
+                    AND INDEX_NAME != 'PRIMARY'
+            """)
+            indexes = [row[0] for row in self.cursor1.fetchall()]
+            
+            return column_names, column_types, primary_keys, indexes
+        
         except mysql.connector.Error as err:
-           logger.error(f"获取表元数据失败: {err}")
-           raise
+            logger.error(f"获取表元数据失败: {err}")
+            raise
     
     def _generate_value_by_type(self, col_type: str) -> str:
         """根据列的类型生成随机值"""
@@ -388,7 +405,7 @@ class DeadlockGenerator:
                          range_end_idx: int = None) -> str:
         """统一的SQL生成方法"""
         try:            
-            column_names, column_types, primary_keys = self._get_table_metadata()
+            column_names, column_types, primary_keys, indexes = self._get_table_metadata()
             template = self.lock_templates[lock_level][lock_type][template_key]
             if is_continuous:
                 # 对于连续锁定行，先只使用range作为key，后续再扩展less eq等等
@@ -403,7 +420,7 @@ class DeadlockGenerator:
                             f"range_end_idx={range_end_idx}")
                 return self._generate_continuous_lock_sql(
                     template, column_names, column_types, 
-                    primary_keys, row_idx, range_end_idx,
+                    primary_keys, indexes, row_idx, range_end_idx,
                     lock_level, lock_type, template_key
                 )
             else:
@@ -417,7 +434,7 @@ class DeadlockGenerator:
                             f"range_end_idx={range_end_idx}")
                 return self._generate_discrete_lock_sql(
                     template, column_names, column_types, 
-                    primary_keys, row_idx,lock_level,lock_type,template_key
+                    primary_keys, indexes, row_idx,lock_level,lock_type,template_key
                 )
         except Exception as e:
             logger.error(f"生成锁SQL失败: {e}")
@@ -427,6 +444,7 @@ class DeadlockGenerator:
                                column_names: List[str], 
                                column_types: List[str],
                                primary_keys: List[str], 
+                               indexes: List[str],
                                start_idx: int, 
                                end_idx: int,
                                lock_level: str,
@@ -452,7 +470,8 @@ class DeadlockGenerator:
                 column_types,  # 使用所有列类型
                 primary_keys,
                 rows,
-                lock_type
+                lock_type,
+                indexes
             )
             
             # 获取模板需要的参数
@@ -482,7 +501,8 @@ class DeadlockGenerator:
     def _generate_discrete_lock_sql(self, template: str, 
                                  column_names: List[str], 
                                  column_types: List[str],
-                                 primary_keys: List[str], 
+                                 primary_keys: List[str],
+                                 indexes: List[str], 
                                  row_idx: int,
                                  lock_level:str,
                                  lock_type:str,
@@ -505,7 +525,8 @@ class DeadlockGenerator:
                 column_types,
                 primary_keys,
                 rows,
-                lock_type
+                lock_type,
+                indexes
             )
             
             # 获取模板需要的参数
@@ -579,17 +600,11 @@ class DeadlockGenerator:
     def _generate_continuous_intersection(self) -> Dict:
         """生成连续锁定场景，两个事务都是连续锁定"""
         try:
-            # 确保有足够的行可用
-            # total_needed_rows = self.trx1_lock_rows_num + self.trx2_lock_rows_num - intersection_size
-            # if total_rows_num < total_needed_rows:
-                # raise ValueError("表中可用行数不足")
             total_needed_rows = random.randint(1, self.total_rows_num)
             
             # 随机选择起始位置
             start_id = random.randint(1, self.total_rows_num - total_needed_rows + 1)
             end_id = start_id + total_needed_rows - 1
-            # intersection_start_id = random.randint(start_id, total_rows_num - intersection_size + 1)
-            # intersection_end_id = intersection_start_id + intersection_size - 1
 
             trx1_start_id = start_id
             trx1_end_id = random.randint(trx1_start_id, end_id)
@@ -1490,14 +1505,15 @@ class SQLParamGenerator:
     """SQL参数生成器"""
     def __init__(self, table_name: str, column_names: List[str], 
                 column_types: List[str], primary_keys: List[str], 
-                rows: List[tuple],lock_type:str):
+                rows: List[tuple], lock_type: str, indexes: List[str] = None):  # 添加indexes参数
         self.table_name = table_name
         self.column_names = column_names
         self.column_types = column_types
         self.primary_keys = primary_keys
         self.rows = rows
         self.lock_type = lock_type
-
+        self.indexes = indexes or []  # 如果没有传入索引，使用空列表
+        
         # 缓存随机选择的列及其类型
         self._current_random_column = None
         self._current_column_type = None
@@ -1512,7 +1528,7 @@ class SQLParamGenerator:
             "insert_cols": lambda: self._generate_insert_columns(),
             "gap_lock_cond": lambda: self._generate_gap_lock_condition(),
             "col": lambda: self._get_random_column(),  # 返回列名
-            "idx": lambda: f"idx_{random.choice(self.column_names)}",
+            "idx": lambda: self._generate_index_name(),  # 修改为使用传入的索引列表
             "set_expr": lambda: self._generate_set_expression(),
             "v1": lambda: self._format_value(self.rows[0][self.column_names.index(self._get_default_column())]),
             "v2": lambda: self._format_value(self.rows[-1][self.column_names.index(self._get_default_column())]),
@@ -1932,6 +1948,12 @@ class SQLParamGenerator:
         except Exception as e:
             logger.error(f"生成UPDATE表达式失败: {e}")
             raise
+
+    def _generate_index_name(self) -> str:
+        """从传入的索引列表中随机选择一个索引"""
+        if self.indexes:
+            return random.choice(self.indexes)
+        return f"idx_{random.choice(self.column_names)}"  # 如果没有索引，回退到使用列名
 
 def _extract_template_params(template: str) -> Set[str]:
     """从模板中提取需要的参数名"""
@@ -2560,13 +2582,13 @@ for i in range(num_of_runs):
         initializer.commit_and_close()
 
         # 生成死锁场景
-        RC_Template = get_iso_template("RC")
+        RR_Template = get_iso_template("RR")
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM table_0")
         total_rows_num = cursor.fetchone()[0]
         cursor.close()
 
-        dlGenerator = DeadlockGenerator("RC", LOCK_HIERARCHY, RC_Template, total_rows_num, "localhost", "root", "123456", "test", 3308)
+        dlGenerator = DeadlockGenerator("RR", LOCK_HIERARCHY, RR_Template, total_rows_num, "localhost", "root", "123456", "test", 3308)
         res_dict, lock_same_resource = dlGenerator._init_resource_distribution()
         print(dlGenerator.trx1_lock_rows_num, dlGenerator.trx2_lock_rows_num, dlGenerator.intersection_size)
 
