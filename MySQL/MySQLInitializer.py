@@ -52,17 +52,30 @@ class MySQLInitializer:
             if column_type != "TEXT":
                 key_candidate_columns.append(column_name)
         
-        # 随机决定要创建多少个额外的键（0到2个）
-        if key_candidate_columns:  # 确保有可用的列来创建键
-            num_extra_keys = random.randint(0, min(2, len(key_candidate_columns)))
-            # 随机选择列创建键
+        # 随机决定要创建多少个额外的索引（0到3个）
+        if key_candidate_columns:  # 确保有可用的列来创建索引
+            num_extra_keys = random.randint(0, min(3, len(key_candidate_columns)))
             for _ in range(num_extra_keys):
                 if key_candidate_columns:  # 确保还有可用的列
-                    key_column = random.choice(key_candidate_columns)
-                    key_candidate_columns.remove(key_column)  # 避免重复使用同一列
-                    key_name = f"key_{key_column}"
-                    key_definitions.append(f"KEY `{key_name}` (`{key_column}`)")
-
+                    # 随机选择单列索引或复合索引
+                    if random.choice([True, False]):  # 50% 的概率生成复合索引
+                        # 随机选择 2 到 min(4, len(key_candidate_columns)) 列
+                        num_columns_in_index = random.randint(2, min(4, len(key_candidate_columns)))
+                        selected_columns = random.sample(key_candidate_columns, num_columns_in_index)
+                        index_type = random.choice(["INDEX", "UNIQUE INDEX"])  # 随机选择索引类型
+                        key_name = f"{index_type.lower().replace(' ', '_')}_" + "_".join(selected_columns)
+                        columns_in_index = ", ".join([f"`{col}`" for col in selected_columns])
+                        key_definitions.append(f"{index_type} `{key_name}` ({columns_in_index})")
+                        # 从候选列中移除已使用的列，避免重复
+                        key_candidate_columns = [col for col in key_candidate_columns if col not in selected_columns]
+                    else:
+                        # 单列索引
+                        key_column = random.choice(key_candidate_columns)
+                        key_candidate_columns.remove(key_column)  # 避免重复使用同一列
+                        index_type = random.choice(["INDEX", "UNIQUE INDEX"])  # 随机选择索引类型
+                        key_name = f"{index_type.lower().replace(' ', '_')}_{key_column}"
+                        key_definitions.append(f"{index_type} `{key_name}` (`{key_column}`)")
+        
         columns_sql = ", ".join(column_definitions)
         key_sql = ", ".join(key_definitions)
         sql = columns_sql + "," + key_sql
