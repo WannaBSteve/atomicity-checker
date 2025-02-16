@@ -1,7 +1,6 @@
 import random
 import mysql.connector
 
-
 class MySQLInitializer:
     def __init__(self, connection, database):
         self.conn = connection
@@ -189,8 +188,9 @@ class MySQLInitializer:
         elif alter_action == "DROP":
             self.cursor.execute(f"DESCRIBE {table_name}")
             columns = [row[0] for row in self.cursor.fetchall()]
-            # 移除id列，确保不会被删除
-            columns = [col for col in columns if col != 'id']
+            # 移除不能删除的关键列
+            protected_columns = ['id', 'col_gap']  # 添加 col_gap 到保护列表
+            columns = [col for col in columns if col not in protected_columns]
             if not columns:
                 return None
             column_to_drop = random.choice(columns)
