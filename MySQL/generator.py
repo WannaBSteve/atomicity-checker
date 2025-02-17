@@ -5,12 +5,13 @@ from MySQLTable import MySQLTableGenerator
 from MySQLInitializer import MySQLInitializer
 from MySQLParameter import SQLParamGenerator
 from MySQLTemplateGen import MySQLTemplateGen
+from MySQLASTGen import MySQLPredicateGenerator
+import MySQLASTGen
 import logging
 import re
 import os
 import time
 from typing import List, Tuple, Dict, Any, Optional, Set, Callable
-from mysql.connector import pooling
 import queue
 
 log_filename = 'atomicity-checker.log'
@@ -309,6 +310,14 @@ class DeadlockGenerator:
             logger.error(f"获取表元数据失败: {err}")
             raise
     
+    def verify_lock(self, target_rows, generated_sql):
+        conn = self.db.create_connection()
+        cursor = conn.cursor()
+        cursor.execute(generated_sql)
+        actual_rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return set(actual_rows) == set(target_rows)
        
     def _generate_lock_sql(self, template_key: str, lock_level: str, 
                         lock_type: str, row_idx: int, 
@@ -329,13 +338,19 @@ class DeadlockGenerator:
                 )
             rows = self.cursor1.fetchall()
             
-            # 使用模板生成器生成SQL
-            template_gen = MySQLTemplateGen(self.lock_templates, self.table_name)
-            return template_gen.generate_lock_sql(
-                template_key, lock_level, lock_type, row_idx,
-                is_continuous, range_end_idx,
-                column_names, column_types, primary_keys, indexes, rows
-            )
+            use_template = False
+            use_ast = True
+            
+            if use_ast:
+                return MySQLASTGen.generate_lock_sql(self.table_name, rows, column_names, lock_type)
+            else:
+                # 使用模板生成器生成SQL
+                template_gen = MySQLTemplateGen(self.lock_templates, self.table_name)
+                return template_gen.generate_lock_sql(
+                    template_key, lock_level, lock_type, row_idx,
+                    is_continuous, range_end_idx,
+                    column_names, column_types, primary_keys, indexes, rows
+                )
                 
         except Exception as e:
             logger.error(f"生成锁SQL失败: {e}")

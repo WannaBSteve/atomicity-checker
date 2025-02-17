@@ -215,12 +215,33 @@ class MySQLPredicateGenerator:
 
     def _gen_simple_comparison(self) -> MySQLExpression:
         """生成简单比较"""
-        id_val = random.choice(self.target_ids)
-        return MySQLBinaryOperation(
-            MySQLColumnReference("id", "t1"),
-            MySQLConstant(id_val),
-            MySQLBinaryOperator.EQUALS
-        )
+        # id_val = random.choice(self.target_ids)
+        # 对每一个target_ids，生成一个等价的谓词，and连接
+        conditions = []
+        for id_val in self.target_ids:
+            conditions.append(
+                MySQLBinaryOperation(
+                    MySQLColumnReference("id", "t1"),
+                    MySQLConstant(id_val),
+                    MySQLBinaryOperator.EQUALS
+                )
+            )
+        # 将conditions用MySQLBinaryOperator.AND连接
+        result = conditions[0]
+        if len(conditions) > 1:
+            for cond in conditions[1:]:
+                result = MySQLBinaryOperation(
+                    result, 
+                    cond, 
+                    MySQLBinaryOperator.AND
+                )
+        return result
+
+        # return MySQLBinaryOperation(
+        #     MySQLColumnReference("id", "t1"),
+        #     MySQLConstant(id_val),
+        #     MySQLBinaryOperator.EQUALS
+        # )
 
     def _gen_between(self) -> MySQLExpression:
         """生成BETWEEN表达式"""
@@ -297,8 +318,14 @@ def generate_lock_sql(table: str, target_rows: List[tuple], column_names: List[s
         generator = MySQLPredicateGenerator(table, target_rows, column_names)
         predicate = generator.generate_predicate()
         
-        lock_clause = "FOR UPDATE" if lock_type == "X" else "LOCK IN SHARE MODE"
-        
+        if lock_type == "X":
+            lock_clause = "FOR UPDATE" 
+        elif lock_type == "S":
+            lock_clause = "LOCK IN SHARE MODE"
+        else: 
+            lock_clause = None
+
+        # 生成SQL语句
         select = MySQLSelect(
             select_list=[MySQLColumnReference("*", "t1")],
             from_table=table,
@@ -312,3 +339,4 @@ def generate_lock_sql(table: str, target_rows: List[tuple], column_names: List[s
     except Exception as e:
         logger.error(f"生成锁定SQL失败: {e}")
         raise
+
