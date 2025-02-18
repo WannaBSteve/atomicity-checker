@@ -40,6 +40,16 @@ class SQLParamGenerator:
             "update_expr": lambda: self._generate_update_expression()  # 新增
         }
 
+        self.unique_columns = set()  # 新增：存储唯一索引列的集合
+        
+        # 解析indexes来识别唯一索引列
+        if indexes:
+            for idx in indexes:
+                if idx.startswith('unique_index_'):
+                    # 从索引名中提取列名，格式为：unique_index_col_X
+                    col_name = idx.replace('unique_index_', '')
+                    self.unique_columns.add(col_name)
+
     def _get_random_column(self) -> str:
         """随机选择一列，但避开主键列，并缓存列类型"""
         if self._current_random_column is None:
@@ -333,7 +343,7 @@ class SQLParamGenerator:
             return self._format_condition("col_gap", 0)  # 发生错误时返回一个基本条件
     
     def _generate_set_expression(self) -> str:
-        """生成SET表达式，确保值与列类型匹配"""
+        """生成SET表达式，确保值与列类型匹配且不违反唯一索引约束"""
         # 排除主键列
         available_columns = [col for col in self.column_names if col not in self.primary_keys]
         if not available_columns:
@@ -346,7 +356,20 @@ class SQLParamGenerator:
         set_expressions = []
         for col in update_cols:
             col_type = self.column_type_map[col]
-            value = self._generate_value_by_type(col_type)
+            
+            # 检查是否是唯一索引列
+            if any(idx.startswith('unique_index_') and idx.endswith(f'_{col}') for idx in (self.indexes or [])):
+                # 对于唯一索引列，使用基于id的动态表达式
+                if "int" in col_type.lower():
+                    value = f"id + {random.randint(1000, 9999)}"
+                elif "float" in col_type.lower() or "double" in col_type.lower():
+                    value = f"id + {random.uniform(1.1, 9.9)}"
+                else:  # 字符串类型
+                    value = f"CONCAT('val_', id, '_', '{self._generate_random_string(3)}')"
+            else:
+                # 非唯一索引列使用普通的随机值
+                value = self._generate_value_by_type(col_type)
+            
             set_expressions.append(f"{col} = {value}")
             
         return ", ".join(set_expressions)
@@ -376,7 +399,7 @@ class SQLParamGenerator:
             raise
 
     def _generate_insert_values(self, lock_type: str) -> str:
-        """生成INSERT语句的VALUES部分"""
+        """生成INSERT语句的VALUES"""
         try:
             # 获取col_gap列的值
             col_gap_values = sorted([row[1] for row in self.rows])  # 假设col_gap是第二列

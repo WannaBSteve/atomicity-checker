@@ -1,9 +1,11 @@
 from abc import ABC, abstractmethod
 from enum import Enum
-from typing import List, Optional, Union, Set, Dict
+from typing import List, Optional, Union, Set, Dict, Tuple, Any
 from dataclasses import dataclass
 import random
 import logging
+from MySQLParameter import SQLParamGenerator
+import re
 
 logger = logging.getLogger('atomicity-checker')
 
@@ -50,13 +52,21 @@ class MySQLConstant(MySQLExpression):
     value: Union[int, str, float, bool, None]
 
     def get_sql(self) -> str:
-        if self.value is None:
+        if isinstance(self.value, str) and self.value.upper() == 'NULL':
+            return "NULL"  # 特殊处理字符串形式的"NULL"
+        elif self.value is None:
             return "NULL"
-        if isinstance(self.value, bool):
-            return "TRUE" if self.value else "FALSE"
-        if isinstance(self.value, (int, float)):
+        elif isinstance(self.value, (int, float)):
             return str(self.value)
-        return f"'{self.value}'"
+        elif isinstance(self.value, bool):
+            return "TRUE" if self.value else "FALSE"
+        else:
+            # 处理字符串值
+            val = str(self.value).strip()
+            val = val.lstrip(" '\"")
+            val = val.rstrip(" '\"")
+            val = val.replace("'", "''")
+            return f"'{val}'"
 
 @dataclass
 class MySQLColumnReference(MySQLExpression):
@@ -188,6 +198,151 @@ class MySQLSelect:
             sql += f" {self.lock_clause}"
         return sql
 
+@dataclass
+class MySQLDelete(MySQLExpression):
+    """DELETE语句的AST节点"""
+    table: str
+    where: Optional[MySQLExpression] = None
+    table_alias: Optional[str] = None
+
+    def get_sql(self) -> str:
+        # 构建基本的DELETE语句
+        if self.table_alias:
+            sql = f"DELETE FROM {self.table} AS {self.table_alias}"
+        else:
+            sql = f"DELETE FROM {self.table}"
+        
+        # 添加WHERE子句
+        if self.where:
+            where_sql = self.where.get_sql()
+            sql += f" WHERE {where_sql}"
+        
+        return sql
+
+@dataclass
+class MySQLInPredicate(MySQLExpression):
+    """IN谓词"""
+    column: str
+    values: List[Union[int, str, float, None]]
+    
+    def get_sql(self) -> str:
+        if not self.values:  # 空列表
+            return "FALSE"  # 空 IN 返回 FALSE
+        values_sql = ", ".join(MySQLConstant(v).get_sql() for v in self.values)
+        return f"{self.column} IN ({values_sql})"
+
+@dataclass
+class MySQLExistsPredicate(MySQLExpression):
+    """EXISTS谓词"""
+    subquery: MySQLExpression
+    
+    def get_sql(self) -> str:
+        subquery_sql = self.subquery.get_sql()
+        # 确保子查询的括号是完整的
+        if '(' in subquery_sql:
+            left_count = subquery_sql.count('(')
+            right_count = subquery_sql.count(')')
+            if left_count > right_count:
+                subquery_sql += ')' * (left_count - right_count)
+        
+        # 简化复杂的条件
+        if "id = id" in subquery_sql:
+            # 将 WHERE ((id = id) AND id IN (7)) 简化为 WHERE id IN (7)
+            subquery_sql = re.sub(r'\(\(id = id\) AND (.*?)\)', r'\1)', subquery_sql)
+        
+        return f"EXISTS ({subquery_sql})"
+
+@dataclass
+class MySQLCase(MySQLExpression):
+    """CASE表达式"""
+    condition: MySQLExpression
+    true_value: MySQLExpression
+    false_value: MySQLExpression
+
+    def get_sql(self) -> str:
+        # 简化 CASE WHEN 表达式
+        condition_sql = self.condition.get_sql()
+        # 如果条件是简单的 IN 判断，直接返回条件
+        if 'IN' in condition_sql:
+            return condition_sql
+        return f"CASE WHEN {condition_sql} THEN {self.true_value.get_sql()} ELSE {self.false_value.get_sql()} END"
+
+@dataclass
+class MySQLSubquery(MySQLExpression):
+    """子查询"""
+    select_list: List[MySQLExpression]
+    from_table: str
+    where: Optional[MySQLExpression] = None
+    table_alias: Optional[str] = None
+    
+    def get_sql(self) -> str:
+        select_items = ", ".join([expr.get_sql() for expr in self.select_list])
+        if self.table_alias:
+            from_clause = f"{self.from_table} AS {self.table_alias}"
+        else:
+            from_clause = self.from_table
+            
+        sql = f"SELECT {select_items} FROM {from_clause}"
+        if self.where:
+            where_sql = self.where.get_sql()
+            # 确保WHERE子句的括号是完整的
+            if '(' in where_sql:
+                left_count = where_sql.count('(')
+                right_count = where_sql.count(')')
+                if left_count > right_count:
+                    where_sql += ')' * (left_count - right_count)
+            sql += f" WHERE {where_sql}"
+        return sql
+
+@dataclass
+class MySQLUpdate(MySQLExpression):
+    """UPDATE语句的AST节点"""
+    table: str
+    set_items: List[Tuple[str, Any]]  # [(column, value), ...]
+    where: Optional[MySQLExpression] = None
+    table_alias: Optional[str] = None
+
+    def get_sql(self) -> str:
+        # 构建基本的UPDATE语句
+        if self.table_alias:
+            sql = f"UPDATE {self.table} AS {self.table_alias}"
+        else:
+            sql = f"UPDATE {self.table}"
+        
+        # 构建SET子句
+        set_exprs = []
+        for col, val in self.set_items:
+            set_exprs.append(f"{col} = {val}")
+        sql += f" SET {', '.join(set_exprs)}"
+        
+        # 添加WHERE子句
+        if self.where:
+            where_sql = self.where.get_sql()
+            if '(' in where_sql and not where_sql.endswith(')'):
+                where_sql += ')'
+            sql += f" WHERE {where_sql}"
+        
+        return sql
+
+@dataclass
+class MySQLInsert(MySQLExpression):
+    """INSERT语句的AST节点"""
+    table: str
+    columns: List[str]
+    values_str: str
+
+    def get_sql(self) -> str:
+        # 构建基本的INSERT语句
+        sql = f"INSERT INTO {self.table}"
+        
+        # 添加列名
+        if self.columns:
+            sql += f" ({', '.join(self.columns)})"
+
+        sql += f" VALUES ({self.values_str})"
+        return sql
+
+
 class MySQLPredicateGenerator:
     """MySQL谓词生成器"""
     def __init__(self, table: str, target_rows: List[tuple], column_names: List[str]):
@@ -197,8 +352,22 @@ class MySQLPredicateGenerator:
         self.id_index = column_names.index("id")
         self.target_ids = [row[self.id_index] for row in self.target_rows]
 
-    def generate_predicate(self, depth: int = 2) -> MySQLExpression:
-        """生成随机谓词"""
+    def generate_predicate(self, depth: int = 2, for_delete: bool = False, for_update: bool = False) -> MySQLExpression:
+        """生成匹配目标行的谓词"""
+        if for_delete or for_update:
+            # DELETE 和 UPDATE 语句使用简单的条件，避免相关子查询
+            if len(self.target_ids) > 1:
+                return self._gen_in_list()
+            elif len(self.target_ids) == 1:
+                return MySQLBinaryOperation(
+                    MySQLColumnReference("id", "t1"),
+                    MySQLConstant(self.target_ids[0]),
+                    MySQLBinaryOperator.EQUALS
+                )
+            else:
+                return MySQLConstant(False)
+        
+        # 原有的谓词生成逻辑
         if depth <= 0:
             return self._gen_simple_comparison()
 
@@ -211,6 +380,7 @@ class MySQLPredicateGenerator:
             self._gen_case,
             lambda: self._gen_correlated_subquery(depth - 1)
         ]
+
         return random.choice(generators)()
 
     def _gen_simple_comparison(self) -> MySQLExpression:
@@ -311,32 +481,89 @@ class MySQLPredicateGenerator:
         
         return MySQLExists(subquery)
 
-def generate_lock_sql(table: str, target_rows: List[tuple], column_names: List[str], 
-                     lock_type: str) -> str:
-    """生成带锁的SQL语句"""
-    try:
-        generator = MySQLPredicateGenerator(table, target_rows, column_names)
-        predicate = generator.generate_predicate()
-        
-        if lock_type == "X":
-            lock_clause = "FOR UPDATE" 
-        elif lock_type == "S":
-            lock_clause = "LOCK IN SHARE MODE"
-        else: 
-            lock_clause = None
 
-        # 生成SQL语句
-        select = MySQLSelect(
-            select_list=[MySQLColumnReference("*", "t1")],
-            from_table=table,
-            table_alias="t1",
-            where=predicate,
-            lock_clause=lock_clause
+@dataclass
+class MySQLASTGen:
+    """MySQL AST生成器"""
+    def __init__(self, table: str, target_rows: List[tuple], column_names: List[str], 
+                 column_types: List[str], primary_keys: List[str], lock_type: str):
+        self.table = table
+        self.target_rows = target_rows
+        self.column_names = column_names
+        self.column_types = column_types
+        self.primary_keys = primary_keys
+        self.lock_type = lock_type
+        self.param_generator = SQLParamGenerator(
+            table, column_names, column_types, primary_keys, target_rows, lock_type
         )
+
+    def generate_lock_sql(self, stmt_type: str = "SELECT") -> str:
+        """生成带锁的SQL语句"""
+        try:
+            if stmt_type == "INSERT":
+                return self._generate_insert()
+            elif stmt_type == "UPDATE":
+                return self._generate_update()
+            elif stmt_type == "DELETE":
+                return self._generate_delete()
+            else:  # SELECT
+                return self._generate_select()
+        except Exception as e:
+            logger.error(f"生成锁定SQL失败: {e}")
+            raise
+
+    def _generate_insert(self) -> str:
+        """生成INSERT语句"""
+        # 从param_generator获取列和值
+        columns = self.param_generator._generate_insert_columns().split(", ")
+        values_str = self.param_generator._generate_insert_values(self.lock_type)
         
-        return select.get_sql()
+        return MySQLInsert(
+            table=self.table,
+            columns=columns,
+            values_str=values_str
+        ).get_sql()
+
+    def _generate_update(self) -> str:
+        """生成UPDATE语句"""
+        # 从param_generator获取SET表达式
+        set_expr = self.param_generator._generate_set_expression()
+        set_items = []
+        for item in set_expr.split(", "):
+            col, val = item.split(" = ")
+            set_items.append((col, val))
+
+        # 使用谓词生成器生成WHERE子句
+        predicate_gen = MySQLPredicateGenerator(self.table, self.target_rows, self.column_names)
         
-    except Exception as e:
-        logger.error(f"生成锁定SQL失败: {e}")
-        raise
+        return MySQLUpdate(
+            table=self.table,
+            table_alias="t1",  # 可选使用别名
+            set_items=set_items,
+            where=predicate_gen.generate_predicate(for_update=True)
+        ).get_sql()
+
+    def _generate_delete(self) -> str:
+        """生成DELETE语句"""
+        # 使用谓词生成器生成WHERE子句
+        predicate_gen = MySQLPredicateGenerator(self.table, self.target_rows, self.column_names)
+        
+        return MySQLDelete(
+            table=self.table,
+            table_alias="t1",  # 可选使用别名
+            where=predicate_gen.generate_predicate(for_delete=True)
+        ).get_sql()
+
+    def _generate_select(self) -> str:
+        """生成SELECT语句"""
+        predicate_gen = MySQLPredicateGenerator(self.table, self.target_rows, self.column_names)
+        lock_clause = "FOR UPDATE" if self.lock_type == "X" else "LOCK IN SHARE MODE"
+        
+        return MySQLSelect(
+            select_list=[MySQLColumnReference("*", "t1")],
+            from_table=self.table,
+            table_alias="t1",
+            where=predicate_gen.generate_predicate(),
+            lock_clause=lock_clause
+        ).get_sql()
 

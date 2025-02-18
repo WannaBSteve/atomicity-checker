@@ -5,8 +5,7 @@ from MySQLTable import MySQLTableGenerator
 from MySQLInitializer import MySQLInitializer
 from MySQLParameter import SQLParamGenerator
 from MySQLTemplateGen import MySQLTemplateGen
-from MySQLASTGen import MySQLPredicateGenerator
-import MySQLASTGen
+from MySQLASTGen import MySQLASTGen
 import logging
 import re
 import os
@@ -342,7 +341,14 @@ class DeadlockGenerator:
             use_ast = True
             
             if use_ast:
-                return MySQLASTGen.generate_lock_sql(self.table_name, rows, column_names, lock_type)
+                ast_gen = MySQLASTGen(self.table_name, rows, column_names, column_types, primary_keys, lock_type)
+                # 根据锁类型选择合适的语句类型
+                if lock_type in ["GAP", "NK", "II"]:
+                    stmt_type = random.choice(["INSERT", "UPDATE", "SELECT", "DELETE"])
+                else:
+                    stmt_type = random.choice(["SELECT", "UPDATE", "DELETE"])  # 其他锁类型可以随机选择
+        
+                return ast_gen.generate_lock_sql(stmt_type)
             else:
                 # 使用模板生成器生成SQL
                 template_gen = MySQLTemplateGen(self.lock_templates, self.table_name)
@@ -354,110 +360,6 @@ class DeadlockGenerator:
                 
         except Exception as e:
             logger.error(f"生成锁SQL失败: {e}")
-            raise
-       
-    def _generate_continuous_lock_sql(self, template: str, 
-                               column_names: List[str], 
-                               column_types: List[str],
-                               primary_keys: List[str], 
-                               indexes: List[str],
-                               start_idx: int, 
-                               end_idx: int,
-                               lock_level: str,
-                               lock_type: str,
-                               template_key: str) -> str:
-        """生成连续锁定的SQL"""
-        try:
-            # 获取范围内的所有行
-            self.cursor1.execute(
-                f"SELECT * FROM {self.table_name} LIMIT {end_idx - start_idx + 1} OFFSET {start_idx - 1}"
-            )
-            rows = self.cursor1.fetchall()
-            row_nums = len(rows)
-            if not rows:
-                logger.info(f"找不到从{start_idx}到{end_idx}的行,当前事务没有独占行")
-                return None
-            
-            
-            # 创建SQL参数生成器 - 使用所有列而不是selected_columns
-            param_generator = SQLParamGenerator(
-                self.table_name,
-                column_names,  # 使用所有列名
-                column_types,  # 使用所有列类型
-                primary_keys,
-                rows,
-                lock_type,
-                indexes
-            )
-            
-            # 获取模板需要的参数
-            needed_params = _extract_template_params(template)
-            params = param_generator.generate_params(needed_params)
-            print(f"needed_params: {needed_params}")
-            print(f"params: {params}")
-
-            logger.info(f"needed_params: {needed_params}")
-            logger.info(f"params: {params}")
-
-            if lock_type != "GAP" and lock_type != "II" and lock_type != "NK":
-                # 处理范围查询的特殊参数
-                if 'v1' in needed_params:
-                    params['v1'] = str(start_idx)
-                if 'v2' in needed_params:
-                    params['v2'] = str(end_idx)
-                if 'col' in needed_params:
-                    params['col'] = 'id'  # 使用id列作为范围查询的列
-            
-            return template.format(**params)
-            
-        except Exception as e:
-            logger.error(f"生成连续锁定SQL失败: {e}")
-            raise
-
-    def _generate_discrete_lock_sql(self, template: str, 
-                                 column_names: List[str], 
-                                 column_types: List[str],
-                                 primary_keys: List[str],
-                                 indexes: List[str], 
-                                 row_idx: int,
-                                 lock_level:str,
-                                 lock_type:str,
-                                 template_key:str) -> str:
-        """生成离散锁定的SQL，使用参数生成器实现动态参数"""
-        try:
-            # 获取指定行
-            self.cursor1.execute(
-                f"SELECT * FROM {self.table_name} LIMIT 1 OFFSET {row_idx - 1}"
-            )
-            rows = self.cursor1.fetchall()
-            if len(rows) == 0:
-                logger.info(f"找不到索引为{row_idx}的行")
-                return None
-
-            # 创建SQL参数生成器
-            param_generator = SQLParamGenerator(
-                self.table_name,
-                column_names,
-                column_types,
-                primary_keys,
-                rows,
-                lock_type,
-                indexes
-            )
-            
-            # 获取模板需要的参数
-            needed_params = _extract_template_params(template)
-            params = param_generator.generate_params(needed_params)
-            print(f"needed_params: {needed_params}")
-            print(f"params: {params}")
-
-            logger.info(f"needed_params: {needed_params}")
-            logger.info(f"params: {params}")
-            
-            return template.format(**params)
-            
-        except Exception as e:
-            logger.error(f"生成离散锁定SQL失败: {e}")
             raise
 
     def _init_resource_distribution(self):
@@ -762,29 +664,6 @@ class DeadlockGenerator:
             logger.error(f"生成死锁事务序列失败: {e}")
             logger.error("")
             raise
-
-    def _select_random_lock_type(self, resource_type: str = "row") -> str:
-        """从当前隔离级别支持的锁类型中随机选择一个"""
-        available_locks = iso_lock_support[self.isolation_level][resource_type]
-        return random.choice(available_locks)
-
-    def _select_compatible_lock(self, existing_lock: str, resource_type: str = "row") -> str:
-        """选择一个与现有锁兼容的锁类型"""
-        available_locks = iso_lock_support[self.isolation_level][resource_type]
-        compatible_locks = [
-            lock_type for lock_type in available_locks
-            if row_lock_compatibility[lock_type][existing_lock]
-        ]
-        return random.choice(compatible_locks) if compatible_locks else None
-
-    def _select_incompatible_lock(self, existing_lock: str, resource_type: str = "row") -> str:
-        """选择一个与现有锁不兼容的锁类型"""
-        available_locks = iso_lock_support[self.isolation_level][resource_type]
-        incompatible_locks = [
-            lock_type for lock_type in available_locks
-            if not row_lock_compatibility[lock_type][existing_lock]
-        ]
-        return random.choice(incompatible_locks) if incompatible_locks else None
 
     def _handle_intersection_phase1(self, serial: List[Tuple]) -> List[Tuple]:
         """第一阶段：对交集资源加锁"""
@@ -1417,11 +1296,6 @@ class DeadlockGenerator:
             logger.error("")
             raise
 
-
-def _extract_template_params(template: str) -> Set[str]:
-    """从模板中提取需要的参数名"""
-    return set(re.findall(r'{(\w+)}', template))
-
 class AtomicityChecker:
     def __init__(self, host: str, user: str, password: str, database: str, port: int,
                  trx1: List[str], trx2: List[str], serial: List[Tuple[int, str]]):
@@ -2013,6 +1887,7 @@ num_of_runs = 100
 logger.info("INFO TEST")
 logger.debug("DEBUG TEST")
 logger.error("ERROR TEST")
+bug_count = 1
 for i in range(num_of_runs):
     # 添加日志记录
     print(f"iter: {i}") 
@@ -2082,7 +1957,6 @@ for i in range(num_of_runs):
         logger.info(f"snapshots: {atomicity_checker.get_snapshots()}")
         logger.info("")
 
-        bug_count = 1
         if not is_atomic:
             # 创建保存bug case的目录
             bug_case_dir = f"{database_save_dir}/bug_case_{bug_count}"
