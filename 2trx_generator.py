@@ -12,9 +12,6 @@ import os
 import time
 from typing import List, Tuple, Dict, Any, Optional, Set, Callable
 import queue
-import itertools
-import threading
-import mysql
 
 log_filename = 'atomicity-checker.log'
 if not os.path.exists(log_filename):
@@ -244,236 +241,34 @@ class DeadlockGenerator:
     """死锁场景生成器"""
     def __init__(self, isolation_level: str, lock_hierarchy: dict, 
                 lock_templates: dict, total_rows_num: int, host: str, user: str, 
-                password: str, database: str, port: int, num_transactions: int = 3):
-        """初始化死锁生成器"""
-        self.isolation_level = isolation_level
-        self.lock_hierarchy = lock_hierarchy
-        self.lock_templates = lock_templates
-        self.total_rows_num = total_rows_num
-        self.num_transactions = num_transactions
-        
-        # 数据库连接配置
-        self.db_config = {
-            "host": host,
-            "user": user,
-            "password": password,
-            "database": database,
-            "port": port
-        }
-        
-        # 初始化主连接和游标（用于获取元数据等）
-        self.conn1 = mysql.connector.connect(**self.db_config)
-        self.cursor1 = self.conn1.cursor(buffered=True)
-        self.cursor1.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {ISOLATION_LEVELS[isolation_level]}")
-        
-        # 初始化事务连接和游标
-        self.connections = []
-        self.cursors = []
-        for i in range(num_transactions):
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor(buffered=True)
-            cursor.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {ISOLATION_LEVELS[isolation_level]}")
-            self.connections.append(conn)
-            self.cursors.append(cursor)
-        
-        # 设置表名
-        self.table_name = "table_0"  # 假设使用默认表名
+                password: str, database: str, port: int):
+       """
+       初始化死锁生成器
+       """
+       self.isolation_level = isolation_level
+       self.lock_hierarchy = lock_hierarchy
+       self.lock_templates = lock_templates
+       self.table_name = "table_0"
+       self.trx1_lock_rows_num = None
+       self.trx2_lock_rows_num = None
+       self.predicted_rollback_trx_id = None
+       self.intersection_size = None
+       self.total_rows_num = total_rows_num
 
-    def create_connection(self):
-        return mysql.connector.connect(**self.db_config)
-
-    def _generate_lock_sql(self, template_key: str, lock_level: str, 
-                    lock_type: str, row_idx: int, 
-                    is_continuous: bool = False, 
-                    range_end_idx: int = None) -> str:
-        """统一的SQL生成方法"""
-        try:            
-            column_names, column_types, primary_keys, indexes = self._get_table_metadata()
-            
-            # 获取行数据
-            if is_continuous:
-                self.cursor1.execute(
-                    f"SELECT * FROM {self.table_name} LIMIT {range_end_idx - row_idx + 1} OFFSET {row_idx - 1}"
-                )
-            else:
-                self.cursor1.execute(
-                    f"SELECT * FROM {self.table_name} LIMIT 1 OFFSET {row_idx - 1}"
-                )
-            rows = self.cursor1.fetchall()
-            
-            # 使用 AST 生成器
-            ast_gen = MySQLASTGen(self.table_name, rows, column_names, column_types, primary_keys, lock_type)
-            
-            # 根据锁类型选择合适的语句类型
-            if lock_type in ["GAP", "NK", "II"]:
-                stmt_type = random.choice(["INSERT", "UPDATE", "SELECT", "DELETE"])
-            else:
-                stmt_type = random.choice(["SELECT", "UPDATE", "DELETE"])  # 其他锁类型可以随机选择
-        
-            return ast_gen.generate_lock_sql(stmt_type)
-                
-        except Exception as e:
-            logger.error(f"生成锁SQL失败: {e}")
-            raise
-
-    def _generate_deadlock_trx_serial(self, max_statements: int) -> Tuple[Dict[int, List[str]], List[Tuple]]:
-        """生成死锁事务序列"""
-        try:
-            # 初始化每个事务的SQL列表
-            self.trx_sqls = {i: ["BEGIN"] for i in range(self.num_transactions)}
-            serial = [(i, "BEGIN") for i in range(self.num_transactions)]
-            
-            # 第一阶段：每个事务锁定自己的独占资源
-            for i in range(self.num_transactions):
-                if self.trx_resources[i]['exclusive_ids']:
-                    lock_type = random.choice(["S", "X"])  # 简化锁类型选择
-                    if self.trx_resources[i]['continuous']:
-                        sql = self._generate_lock_sql("range", "row", lock_type,
-                                                   min(self.trx_resources[i]['exclusive_ids']),
-                                                   True,
-                                                   max(self.trx_resources[i]['exclusive_ids']))
-                    else:
-                        sql = self._generate_lock_sql("basic", "row", lock_type,
-                                                   self.trx_resources[i]['exclusive_ids'][0],
-                                                   False)
-                    self.trx_sqls[i].append(sql)
-                    serial.append((i, sql))
-            
-            # 第二阶段：每个事务请求其他事务的共享资源
-            for i in range(self.num_transactions):
-                if self.trx_resources[i]['shared_ids']:
-                    lock_type = random.choice(["S", "X"])  # 简化锁类型选择
-                    for shared_id in self.trx_resources[i]['shared_ids']:
-                        sql = self._generate_lock_sql("basic", "row", lock_type,
-                                                   shared_id,
-                                                   False)
-                        self.trx_sqls[i].append(sql)
-                        serial.append((i, sql))
-            
-            # 添加提交语句
-            for i in range(self.num_transactions):
-                self.trx_sqls[i].append("COMMIT")
-                serial.append((i, "COMMIT"))
-                
-            return self.trx_sqls, serial
-            
-        except Exception as e:
-            logger.error(f"生成死锁事务序列失败: {e}")
-            raise
-
-    def cleanup(self):
-        """清理资源"""
-        # 关闭主连接和游标
-        if hasattr(self, 'cursor1'):
-            try:
-                self.cursor1.close()
-            except:
-                pass
-        if hasattr(self, 'conn1'):
-            try:
-                self.conn1.close()
-            except:
-                pass
-            
-        # 关闭事务连接和游标
-        for cursor in self.cursors:
-            try:
-                cursor.close()
-            except:
-                pass
-        for conn in self.connections:
-            try:
-                conn.close()
-            except:
-                pass
-
-    def generate_deadlock(self) -> Tuple[List[str], List[str], List[Tuple]]:
-        """
-        生成死锁场景
-        
-        Returns:
-            Tuple[List[str], List[str], List[Tuple]]: 返回(事务1的SQL列表, 事务2的SQL列表, 执行序列)
-        """
-        try:
-            print("开始生成死锁场景")
-            logger.info("开始生成死锁场景")
-            
-            # 初始化资源分配
-            self.trx_resources, has_intersection = self._init_resource_distribution()
-            
-            print(f"资源分配结果: {self.trx_resources}")
-            print(f"分配模式: {self.distribution_mode}")
-            logger.info(f"资源分配结果: {self.trx_resources}")
-            logger.info(f"分配模式: {self.distribution_mode}")
-            
-            # 生成死锁事务序列
-            max_statements = 20  # 限制最大语句数
-            trx_sqls, serial = self._generate_deadlock_trx_serial(max_statements)
-            
-            print("生成的事务序列:")
-            for trx_id, sqls in trx_sqls.items():
-                print(f"事务{trx_id}: {sqls}")
-            print(f"执行序列: {serial}")
-            
-            
-            return trx_sqls, serial
-            
-        except Exception as e:
-            logger.error(f"生成死锁场景失败: {e}")
-            raise
-
-    def execute_deadlock_serial(self, serial: List[Tuple[int, str]]) -> Tuple[bool, List[int]]:
-        """
-        执行死锁序列
-        
-        Args:
-            serial: 执行序列，每个元素为(事务ID, SQL语句)的元组
-        
-        Returns:
-            Tuple[bool, List[int]]: (是否成功执行完所有语句, 被回滚的事务ID列表)
-        """
-        try:
-            print("开始执行死锁序列")
-            logger.info("开始执行死锁序列")
-            
-            rollback_trxs = []
-            executed_statements = []
-            
-            for trx_id, sql in serial:
-                print(f"执行事务{trx_id}: {sql}")
-                logger.info(f"执行事务{trx_id}: {sql}")
-                
-                try:
-                    if sql.upper() == "BEGIN":
-                        continue
-                    elif sql.upper() == "COMMIT":
-                        self.connections[trx_id].commit()
-                    else:
-                        self.cursors[trx_id].execute(sql)
-                    executed_statements.append((trx_id, sql))
-                    
-                except mysql.connector.Error as err:
-                    print(f"事务{trx_id}执行失败: {err}")
-                    logger.error(f"事务{trx_id}执行失败: {err}")
-                    
-                    if err.errno == 1213:  # 死锁错误码
-                        rollback_trxs.append(trx_id)
-                        self.connections[trx_id].rollback()
-                        print(f"事务{trx_id}被回滚")
-                        logger.info(f"事务{trx_id}被回滚")
-                    else:
-                        raise
-            
-            success = len(rollback_trxs) > 0
-            print(f"执行完成，成功状态: {success}, 被回滚的事务: {rollback_trxs}")
-            logger.info(f"执行完成，成功状态: {success}, 被回滚的事务: {rollback_trxs}")
-            
-            return success, rollback_trxs
-            
-        except Exception as e:
-            logger.error(f"执行死锁序列失败: {e}")
-            raise
-
+       # 数据库连接管理
+       self.db = DatabaseConnection(host, user, password, database, port)
+       self.conn1 = self.db.create_connection()
+       self.conn2 = self.db.create_connection()
+       self.cursor1 = self.conn1.cursor()
+       self.cursor2 = self.conn2.cursor()
+        # 事务SQL语句列表
+       self.trx1: List[str] = []
+       self.trx2: List[str] = []
+    
+       # 初始化兼容/不兼容锁对
+       self.compatible_lock_pairs = self._init_compatible_lock_pairs()
+       self.incompatible_lock_pairs = self._init_incompatible_lock_pairs()
+    
     def _get_table_metadata(self) -> Tuple[List[str], List[str], List[str], List[str]]:
         """获取表的元数据信息
         
@@ -491,7 +286,7 @@ class DeadlockGenerator:
             self.cursor1.execute(f"""
                 SELECT COLUMN_NAME 
                 FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-                WHERE TABLE_SCHEMA = '{self.db_config['database']}'
+                WHERE TABLE_SCHEMA = '{self.db.config['database']}'
                     AND TABLE_NAME = '{self.table_name}'
                     AND CONSTRAINT_NAME = 'PRIMARY'
                 ORDER BY ORDINAL_POSITION
@@ -502,7 +297,7 @@ class DeadlockGenerator:
             self.cursor1.execute(f"""
                 SELECT DISTINCT INDEX_NAME
                 FROM INFORMATION_SCHEMA.STATISTICS 
-                WHERE TABLE_SCHEMA = '{self.db_config['database']}'
+                WHERE TABLE_SCHEMA = '{self.db.config['database']}'
                     AND TABLE_NAME = '{self.table_name}'
                     AND INDEX_NAME != 'PRIMARY'
             """)
@@ -515,7 +310,7 @@ class DeadlockGenerator:
             raise
     
     def verify_lock(self, target_rows, generated_sql):
-        conn = self.db_config.create_connection()
+        conn = self.db.create_connection()
         cursor = conn.cursor()
         cursor.execute(generated_sql)
         actual_rows = cursor.fetchall()
@@ -523,149 +318,299 @@ class DeadlockGenerator:
         conn.close()
         return set(actual_rows) == set(target_rows)
        
-    def _init_resource_distribution(self) -> Tuple[Dict, bool]:
-        """初始化资源分配，使用迭代而不是递归"""
-        max_attempts = 3  # 最大尝试次数
+    def _generate_lock_sql(self, template_key: str, lock_level: str, 
+                        lock_type: str, row_idx: int, 
+                        is_continuous: bool = False, 
+                        range_end_idx: int = None) -> str:
+        """统一的SQL生成方法"""
+        try:            
+            column_names, column_types, primary_keys, indexes = self._get_table_metadata()
+            
+            # 获取行数据
+            if is_continuous:
+                self.cursor1.execute(
+                    f"SELECT * FROM {self.table_name} LIMIT {range_end_idx - row_idx + 1} OFFSET {row_idx - 1}"
+                )
+            else:
+                self.cursor1.execute(
+                    f"SELECT * FROM {self.table_name} LIMIT 1 OFFSET {row_idx - 1}"
+                )
+            rows = self.cursor1.fetchall()
+            
+            use_template = False
+            use_ast = True
+            
+            if use_ast:
+                ast_gen = MySQLASTGen(self.table_name, rows, column_names, column_types, primary_keys, lock_type)
+                # 根据锁类型选择合适的语句类型
+                if lock_type in ["GAP", "NK", "II"]:
+                    stmt_type = random.choice(["INSERT", "UPDATE", "SELECT", "DELETE"])
+                else:
+                    stmt_type = random.choice(["SELECT", "UPDATE", "DELETE"])  # 其他锁类型可以随机选择
         
-        for attempt in range(max_attempts):
-            try:
-                # 随机选择分配模式
-                self.distribution_mode = random.choice(["chain", "star", "mesh"])
-                logger.info(f"选择资源分配模式: {self.distribution_mode}")
+                return ast_gen.generate_lock_sql(stmt_type)
+            else:
+                # 使用模板生成器生成SQL
+                template_gen = MySQLTemplateGen(self.lock_templates, self.table_name)
+                return template_gen.generate_lock_sql(
+                    template_key, lock_level, lock_type, row_idx,
+                    is_continuous, range_end_idx,
+                    column_names, column_types, primary_keys, indexes, rows
+                )
                 
-                # 随机决定每个事务是连续还是离散锁定
-                self.trx_continuous = {i: random.choice([True, False]) for i in range(self.num_transactions)}
-                
-                result = {}
-                all_rows = set(range(1, self.total_rows_num + 1))
-                available_rows = all_rows.copy()
-                
-                # 为每个事务分配独占资源
-                for i in range(self.num_transactions):
-                    if len(available_rows) < 1:
-                        logger.warning(f"尝试 {attempt + 1}: 没有足够的资源分配给事务{i}")
-                        break
-                        
-                    exclusive_size = random.randint(1, min(3, len(available_rows)))
-                    exclusive = set(random.sample(list(available_rows), exclusive_size))
-                    available_rows -= exclusive
-                    
-                    result[i] = {
-                        'row_ids': sorted(list(exclusive)),
-                        'exclusive_ids': sorted(list(exclusive)),
-                        'shared_ids': [],
-                        'continuous': self.trx_continuous[i]
-                    }
-                
-                # 如果所有事务都获得了独占资源，继续分配共享资源
-                if len(result) == self.num_transactions:
-                    success = False
-                    
-                    if self.distribution_mode == "chain":
-                        success = self._add_chain_shared_resources(result, available_rows)
-                    elif self.distribution_mode == "star":
-                        success = self._add_star_shared_resources(result, available_rows)
-                    else:  # mesh
-                        success = self._add_mesh_shared_resources(result, available_rows)
-                    
-                    if success:
-                        self.trx_resources = result
-                        logger.info(f"资源分配结果: {result}")
-                        logger.info(f"分配模式: {self.distribution_mode}")
-                        return result, True
-                        
-                logger.warning(f"尝试 {attempt + 1}: 资源分配失败")
-                
-            except Exception as e:
-                logger.error(f"尝试 {attempt + 1}: 资源分配出错: {e}")
-                continue
+        except Exception as e:
+            logger.error(f"生成锁SQL失败: {e}")
+            raise
+
+    def _init_resource_distribution(self):
+        """初始化资源分配场景"""
+        try:
+            
+            # 获取表的总行数
+            # total_rows_num = self.db.get_result(f"SELECT COUNT(*) FROM {self.table_name}")[0][0]
+            print(f"table {self.table_name} has {self.total_rows_num} rows")
+            logger.info(f"table {self.table_name} has {self.total_rows_num} rows")
+            self.lock_same_resource = random.choice([True, False])
+            
+            # 随机决定是否使用连续锁定
+            self.trx1_lock_rows_continuous = random.choice([True, False])
+            self.trx2_lock_rows_continuous = random.choice([True, False])
+            if self.lock_same_resource is True:
+                res_dict =  self._init_intersection_scenario()
+            else:
+                res_dict =  self._init_non_intersection_scenario()
+            return res_dict,self.lock_same_resource
+        except Exception as e:
+            logger.error(f"初始化资源分配失败: {e}")
+            raise
         
-        raise Exception("资源分配失败：达到最大尝试次数")
+    def _init_intersection_scenario(self) -> Dict:
+        """初始化有交集的场景"""
 
-    def _add_chain_shared_resources(self, result: Dict, available_rows: Set[int]) -> bool:
-        """添加链式共享资源，不使用递归"""
-        try:
-            if len(available_rows) < self.num_transactions:
-                return False
-                
-            # 为每对相邻事务添加共享资源
-            for i in range(self.num_transactions):
-                next_trx = (i + 1) % self.num_transactions
-                
-                if len(available_rows) < 1:
-                    return False
-                    
-                shared_size = random.randint(1, min(2, len(available_rows)))
-                shared_rows = set(random.sample(list(available_rows), shared_size))
-                
-                # 更新两个事务的共享资源
-                result[i]['shared_ids'].extend(sorted(list(shared_rows)))
-                result[next_trx]['shared_ids'].extend(sorted(list(shared_rows)))
-                result[i]['row_ids'].extend(sorted(list(shared_rows)))
-                result[next_trx]['row_ids'].extend(sorted(list(shared_rows)))
-                
-                available_rows -= shared_rows
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"添加链式共享资源失败: {e}")
-            return False
+        # max_intersection = min(self.trx1_lock_rows_num, self.trx2_lock_rows_num)
+        # intersection_size = random.randint(1, max_intersection)
 
-    def _add_star_shared_resources(self, result: Dict, available_rows: Set[int]) -> bool:
-        """添加星形共享资源，不使用递归"""
+        # if total_rows_num < (self.trx1_lock_rows_num + self.trx2_lock_rows_num - intersection_size):
+        #     print(f"total_rows_num: {total_rows_num}, trx1_lock_rows_num: {self.trx1_lock_rows_num}, trx2_lock_rows_num: {self.trx2_lock_rows_num}, intersection_size: {intersection_size}")
+        #     logger.info(f"total_rows_num: {total_rows_num}, trx1_lock_rows_num: {self.trx1_lock_rows_num}, trx2_lock_rows_num: {self.trx2_lock_rows_num}, intersection_size: {intersection_size}")
+        #     raise ValueError("请求锁定的总行数超过表中可用行数")
+            
+        if self.trx1_lock_rows_continuous and self.trx2_lock_rows_continuous:
+            return self._generate_continuous_intersection()
+        elif self.trx1_lock_rows_continuous:
+            return self._generate_mixed_intersection(trx1_continuous=True)
+        elif self.trx2_lock_rows_continuous:
+            return self._generate_mixed_intersection(trx1_continuous=False)
+        else:
+            return self._generate_discrete_intersection()
+        
+    def _init_non_intersection_scenario(self) -> Dict:
+        """初始化无交集的场景"""
+        if self.trx1_lock_rows_continuous and self.trx2_lock_rows_continuous:
+            return self._generate_continuous_nonintersection()
+        elif self.trx1_lock_rows_continuous:
+            return self._generate_mixed_nonintersection(trx1_continuous=True)
+        elif self.trx2_lock_rows_continuous:
+            return self._generate_mixed_nonintersection(trx1_continuous=False)
+        else:
+            return self._generate_discrete_nonintersection()
+    
+    def _generate_continuous_intersection(self) -> Dict:
+        """生成连续锁定场景，两个事务都是连续锁定"""
         try:
-            # 随机选择一个中心事务
-            self.center_trx = random.randint(0, self.num_transactions - 1)
+            total_needed_rows = random.randint(1, self.total_rows_num)
             
-            # 为中心事务和每个其他事务添加共享资源
-            for other_trx in range(self.num_transactions):
-                if other_trx == self.center_trx:
-                    continue
-                    
-                if len(available_rows) < 1:
-                    return False
-                    
-                shared_size = random.randint(1, min(2, len(available_rows)))
-                shared_rows = set(random.sample(list(available_rows), shared_size))
-                
-                # 更新共享资源
-                result[other_trx]['shared_ids'].extend(sorted(list(shared_rows)))
-                result[self.center_trx]['shared_ids'].extend(sorted(list(shared_rows)))
-                result[other_trx]['row_ids'].extend(sorted(list(shared_rows)))
-                result[self.center_trx]['row_ids'].extend(sorted(list(shared_rows)))
-                
-                available_rows -= shared_rows
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"添加星形共享资源失败: {e}")
-            return False
+            # 随机选择起始位置
+            start_id = random.randint(1, self.total_rows_num - total_needed_rows + 1)
+            end_id = start_id + total_needed_rows - 1
 
-    def _add_mesh_shared_resources(self, result: Dict, available_rows: Set[int]) -> bool:
-        """添加网状共享资源，不使用递归"""
-        try:
-            # 随机生成事务间的共享关系
-            for i in range(self.num_transactions):
-                for j in range(i + 1, self.num_transactions):
-                    if random.random() < 0.5 and len(available_rows) > 0:  # 50%概率生成共享关系
-                        shared_size = random.randint(1, min(2, len(available_rows)))
-                        shared_rows = set(random.sample(list(available_rows), shared_size))
-                        
-                        # 更新共享资源
-                        result[i]['shared_ids'].extend(sorted(list(shared_rows)))
-                        result[j]['shared_ids'].extend(sorted(list(shared_rows)))
-                        result[i]['row_ids'].extend(sorted(list(shared_rows)))
-                        result[j]['row_ids'].extend(sorted(list(shared_rows)))
-                        
-                        available_rows -= shared_rows
+            trx1_start_id = start_id
+            trx1_end_id = random.randint(trx1_start_id, end_id)
+            trx2_start_id = random.randint(trx1_start_id, trx1_end_id)
+            trx2_end_id = end_id
+
+            intersection_start_id = trx2_start_id
+            intersection_end_id = trx1_end_id
+
+            intersection_size = intersection_end_id - intersection_start_id + 1
             
-            return True
+            # 设置事务1的范围
+            self.trx1_start_id = start_id
+            self.trx1_end_id = intersection_end_id
+            self.trx1_lock_rows_num = trx1_end_id - trx1_start_id + 1
+            self.trx1_exclusive_start_id = start_id
+            self.trx1_exclusive_end_id = intersection_start_id - 1
+
+            # 设置事务2的范围，确保包含交集部分
+            self.trx2_start_id = trx2_start_id
+            self.trx2_end_id = trx2_end_id
+            self.trx2_exclusive_start_id = intersection_end_id + 1
+            self.trx2_exclusive_end_id = end_id
+            self.trx2_lock_rows_num = trx2_end_id - trx2_start_id + 1
+
+            self.intersection_size = intersection_size
+
+            # 计算交集
+            self.intersection_ids = list(range(
+                intersection_start_id,
+                intersection_end_id + 1
+            ))
             
+            # 计算独占行
+            self.trx1_exclusive_ids = list(range(self.trx1_exclusive_start_id, self.trx1_exclusive_end_id + 1)) if self.trx1_exclusive_start_id <= self.trx1_exclusive_end_id else []
+            self.trx2_exclusive_ids = list(range(self.trx2_exclusive_start_id, self.trx2_exclusive_end_id + 1)) if self.trx2_exclusive_start_id <= self.trx2_exclusive_end_id else []
+            
+            # 设置完整的行ID列表
+            self.trx1_lock_row_ids = list(range(self.trx1_start_id, self.trx1_end_id + 1))
+            self.trx2_lock_row_ids = list(range(self.trx2_start_id, self.trx2_end_id + 1))
+
+            # 打印全部参数
+            logger.info(f"trx1_start_id: {self.trx1_start_id}")
+            logger.info(f"trx1_end_id: {self.trx1_end_id}")
+            logger.info(f"trx1_exclusive_start_id: {self.trx1_exclusive_start_id}")
+            logger.info(f"trx1_exclusive_end_id: {self.trx1_exclusive_end_id}")
+            logger.info(f"trx1_exclusive_ids: {self.trx1_exclusive_ids}")
+            logger.info(f"trx2_start_id: {self.trx2_start_id}")
+            logger.info(f"trx2_end_id: {self.trx2_end_id}")
+            logger.info(f"trx2_exclusive_start_id: {self.trx2_exclusive_start_id}")
+            logger.info(f"trx2_exclusive_end_id: {self.trx2_exclusive_end_id}")
+            logger.info(f"trx2_exclusive_ids: {self.trx2_exclusive_ids}")
+            logger.info(f"intersection_ids: {self.intersection_ids}")
+            return {
+                'trx1_lock_row_ids': self.trx1_lock_row_ids,
+                'trx2_lock_row_ids': self.trx2_lock_row_ids,
+                'intersection_row_ids': self.intersection_ids
+            }
         except Exception as e:
-            logger.error(f"添加网状共享资源失败: {e}")
-            return False
+            logger.error(f"生成连续锁定场景失败: {e}")
+            raise
+
+    def _generate_mixed_intersection(self, trx1_continuous: bool) -> Dict:
+        """
+        生成混合锁定场景，一个事务连续锁定，另一个事务离散锁定
+        """
+        try:
+            if trx1_continuous:
+                # 事务1连续锁定
+                trx1_lock_rows_num = random.randint(1, self.total_rows_num)
+                trx1_start_id = random.randint(1, self.total_rows_num - trx1_lock_rows_num + 1)
+                trx1_end_id = trx1_start_id + trx1_lock_rows_num - 1
+                trx1_rows = list(range(trx1_start_id, trx1_end_id + 1))
+                
+                # 从事务1的行中随机选择交集
+                intersection_size = random.randint(1, trx1_lock_rows_num)
+                intersection_rows = sorted(random.sample(trx1_rows, intersection_size))
+
+                trx1_exclusive = [id for id in trx1_rows if id not in intersection_rows]
+                
+                # 为事务2选择剩余的行
+                remaining_rows = [id for id in range(1, self.total_rows_num + 1) if id not in trx1_rows]
+                trx2_exclusive_num = random.randint(0, len(remaining_rows))
+                trx2_exclusive = sorted(random.sample(remaining_rows, trx2_exclusive_num)) if trx2_exclusive_num > 0 else []
+                trx2_rows = sorted(intersection_rows + trx2_exclusive)
+
+                self.trx1_start_id = trx1_start_id
+                self.trx1_end_id = trx1_end_id
+
+                self.trx1_lock_rows_num = trx1_lock_rows_num
+                self.trx1_exclusive_ids = trx1_exclusive
+
+                self.trx2_lock_rows_num = len(trx2_rows)
+                self.trx2_exclusive_ids = trx2_exclusive
+                                
+            else:
+                # 事务2连续锁定
+                trx2_lock_rows_num = random.randint(1, self.total_rows_num)
+                trx2_start_id = random.randint(1, self.total_rows_num - trx2_lock_rows_num + 1)
+                trx2_end_id = trx2_start_id + trx2_lock_rows_num - 1
+                trx2_rows = list(range(trx2_start_id, trx2_end_id + 1))
+
+                # 从事务2的行中随机选择交集
+                intersection_size = random.randint(1, trx2_lock_rows_num)
+                intersection_rows = sorted(random.sample(trx2_rows, intersection_size))
+
+                trx2_exclusive = [id for id in trx2_rows if id not in intersection_rows]
+                
+                remaining_rows = [id for id in range(1, self.total_rows_num + 1) if id not in trx2_rows]
+                trx1_exclusive_num = random.randint(0, len(remaining_rows))
+                trx1_exclusive = sorted(random.sample(remaining_rows, trx1_exclusive_num)) if trx1_exclusive_num > 0 else []
+                trx1_rows = sorted(intersection_rows + trx1_exclusive)
+
+                self.trx2_start_id = trx2_start_id
+                self.trx2_end_id = trx2_end_id
+
+                self.trx2_lock_rows_num = trx2_lock_rows_num
+                self.trx2_exclusive_ids = trx2_exclusive
+
+                self.trx1_lock_rows_num = len(trx1_rows)
+                self.trx1_exclusive_ids = trx1_exclusive
+
+            # 设置类属性
+            self.trx1_lock_row_ids = trx1_rows
+            self.trx2_lock_row_ids = trx2_rows
+            self.intersection_ids = intersection_rows
+            self.intersection_size = intersection_size
+            
+            # 打印全部参数
+            logger.info(f"trx1_lock_row_ids: {self.trx1_lock_row_ids}")
+            logger.info(f"trx2_lock_row_ids: {self.trx2_lock_row_ids}")
+            logger.info(f"intersection_row_ids: {self.intersection_ids}")
+            logger.info(f"trx1_exclusive_ids: {self.trx1_exclusive_ids}")
+            logger.info(f"trx2_exclusive_ids: {self.trx2_exclusive_ids}")
+
+            return {
+                'trx1_lock_row_ids': self.trx1_lock_row_ids,
+                'trx2_lock_row_ids': self.trx2_lock_row_ids,
+                'intersection_row_ids': self.intersection_ids
+            }
+        except Exception as e:
+            logger.error(f"生成混合锁定场景失败: {e}")
+            raise
+
+    def _generate_discrete_intersection(self) -> Dict:
+        """生成离散有交集场景，两个事务都是离散锁定"""
+        try:
+            # 首先生成交集行
+            intersection_size = random.randint(1, self.total_rows_num)
+            intersection_rows = sorted(random.sample(range(1, self.total_rows_num + 1), intersection_size))
+            
+            # 为事务1选择额外的行
+            remaining_rows = [id for id in range(1, self.total_rows_num + 1) if id not in intersection_rows]
+            trx1_exclusive_num = random.randint(0, len(remaining_rows))
+            trx1_exclusive = sorted(random.sample(remaining_rows, trx1_exclusive_num)) if trx1_exclusive_num > 0 else []
+            trx1_rows = sorted(list(set(intersection_rows + trx1_exclusive)))  # 使用set去重
+            
+            # 为事务2选择额外的行
+            remaining_rows = [id for id in range(1, self.total_rows_num + 1) if id not in trx1_rows]
+            trx2_exclusive_num = random.randint(0, len(remaining_rows))
+            trx2_exclusive = sorted(random.sample(remaining_rows, trx2_exclusive_num)) if trx2_exclusive_num > 0 else []
+            trx2_rows = sorted(list(set(intersection_rows + trx2_exclusive)))  # 使用set去重
+            
+            # 设置类属性
+            self.intersection_ids = intersection_rows
+            self.trx1_exclusive_ids = trx1_exclusive
+            self.trx2_exclusive_ids = trx2_exclusive
+            self.trx1_lock_row_ids = trx1_rows
+            self.trx2_lock_row_ids = trx2_rows
+            self.intersection_size = intersection_size
+            self.trx1_lock_rows_num = len(trx1_rows)
+            self.trx2_lock_rows_num = len(trx2_rows)
+            
+            # 打印全部参数
+            logger.info(f"trx1_lock_row_ids: {self.trx1_lock_row_ids}")
+            logger.info(f"trx2_lock_row_ids: {self.trx2_lock_row_ids}")
+            logger.info(f"intersection_row_ids: {self.intersection_ids}")
+            logger.info(f"trx1_exclusive_ids: {self.trx1_exclusive_ids}")
+            logger.info(f"trx2_exclusive_ids: {self.trx2_exclusive_ids}")
+            
+            return {
+                'trx1_lock_row_ids': self.trx1_lock_row_ids,
+                'trx2_lock_row_ids': self.trx2_lock_row_ids,
+                'intersection_row_ids': self.intersection_ids
+            }
+        except Exception as e:
+            logger.error(f"生成离散有交集场景失败: {e}")
+            raise
 
     def _generate_deadlock_with_intersection(self) -> List[Tuple]:
         """处理有交集情况的死锁生成"""
@@ -692,6 +637,34 @@ class DeadlockGenerator:
         serial = self._handle_non_intersection_phase2(serial)
         return serial
     
+    def _generate_deadlock_trx_serial(self, max_statements: int) -> Tuple[List[str], List[str], List[Tuple]]:
+        """生成死锁事务序列的主方法"""
+        try:
+            
+            self.trx1 = ["BEGIN"]
+            self.trx2 = ["BEGIN"]
+            
+            if self.lock_same_resource is True:
+                serial = self._generate_deadlock_with_intersection()
+            else:
+                serial = self._generate_deadlock_without_intersection()
+                
+            # 添加提交语句
+            self.trx1.append("COMMIT;")
+            self.trx2.append("COMMIT;")
+            who_commit_first = random.choice([0, 1])
+            serial.append((who_commit_first + 1, "COMMIT"))
+            # 另一个事务提交
+            serial.append((2-who_commit_first, "COMMIT"))
+            logger.info(f"生成死锁事务序列成功如下")
+            logger.info(f"serial: {serial}")
+            return self.trx1, self.trx2, serial
+            
+        except Exception as e:
+            logger.error(f"生成死锁事务序列失败: {e}")
+            logger.error("")
+            raise
+
     def _handle_intersection_phase1(self, serial: List[Tuple]) -> List[Tuple]:
         """第一阶段：对交集资源加锁"""
         print("intersection phase1")
@@ -1324,20 +1297,8 @@ class DeadlockGenerator:
             raise
 
 class AtomicityChecker:
-    """
-    多事务原子性检查器  
-    
-    test oracle：
-    1. 在多事务并发执行的场景中，无论有多少事务参与，只要某些事务最终被提交（Commit）、某些被回滚（Rollback），则：
-    数据库的最终状态应等同于所有被提交的事务按某种顺序单独执行后的状态，且被回滚的事务不留下任何影响。
-    
-
-    简化test oracle：
-    2. 如果存在一个模拟并发的执行序列serial，某些事务最终被提交（Commit）、某些被回滚（Rollback），则：
-    serial执行后的数据库状态，应等同于serial剔除被回滚的事务后的状态。
-    """
-    def __init__(self, host: str, user: str, password: str, database: str, port: int, isolation_level: str,
-                 trx_sqls: Dict[int, List[str]], serial: List[Tuple[int, str]]):
+    def __init__(self, host: str, user: str, password: str, database: str, port: int,
+                 trx1: List[str], trx2: List[str], serial: List[Tuple[int, str]]):
         """
         初始化原子性检查器
         
@@ -1347,7 +1308,8 @@ class AtomicityChecker:
             password: 数据库密码
             database: 数据库名
             port: 数据库端口
-            trx_sqls: 事务SQL语句字典，格式为{事务ID: [SQL语句列表]}
+            trx1: 事务1的SQL语句列表
+            trx2: 事务2的SQL语句列表
             serial: 死锁场景的执行序列，格式为[(事务ID, SQL语句), ...]
         """
         self.db_config = {
@@ -1361,447 +1323,26 @@ class AtomicityChecker:
             "buffered": True,
             "autocommit": False
         }
-        self.table_name = "table_0"
-        self.trx_sqls = trx_sqls
-        self.num_transactions = len(trx_sqls)
+        self.trx1 = trx1
+        self.trx2 = trx2
         self.serial = serial
-        self.isolation_level = isolation_level
         self.snapshot_before = None
+        self.snapshot_trx1 = None
+        self.snapshot_trx2 = None
         self.snapshot_serial = None
         self.executed_serial = None
         
-        # 为每个事务创建连接和锁
-        self.connections = {}
-        self.conn_locks = {}
-        for i in range(self.num_transactions):
-            self.conn_locks[i] = threading.Lock()
+        self.conn1 = None
+        self.conn2 = None
+        self.conn_locks = {
+            1: threading.Lock(),  # 事务1的连接锁
+            2: threading.Lock()   # 事务2的连接锁
+        }
 
     def _init_connections(self):
-        """为每个事务创建独立的数据库连接"""
-        for trx_id in range(self.num_transactions):
-            if trx_id not in self.connections:
-                conn = mysql.connector.connect(**self.db_config)
-                cursor = conn.cursor()
-                cursor.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {ISOLATION_LEVELS[self.isolation_level]}")
-                cursor.close()
-                self.connections[trx_id] = conn
-
-    def execute_stmt_async(self, trx_id: int, stmt: str, result_queue: queue.Queue):
-        """异步执行SQL语句"""
-        def _execute():
-            conn = self.connections[trx_id]
-            lock = self.conn_locks[trx_id]
-            try:
-                with lock:
-                    cursor = conn.cursor(buffered=True)
-                    cursor.execute(stmt)
-                    if stmt.strip().upper().startswith("SELECT"):
-                        cursor.fetchall()
-                result_queue.put(("success", None))
-                cursor.close()
-            except mysql.connector.Error as err:
-                logger.error(f"执行语句错误: {err}, stmt: {stmt}")
-                if err.errno == 2013 or "Lost connection" in str(err):
-                    try:
-                        cursor.close()
-                        conn.reconnect(attempts=3, delay=1)
-                        cursor = conn.cursor(buffered=True)
-                        cursor.execute(stmt)
-                        if stmt.strip().upper().startswith("SELECT"):
-                            cursor.fetchall()
-                        result_queue.put(("success", None))
-                        logger.info(f"重连执行成功, stmt: {stmt}")
-                        return
-                    except mysql.connector.Error as reconnect_err:
-                        logger.error(f"重连执行失败: {reconnect_err}, stmt: {stmt}")
-                        result_queue.put(("error", reconnect_err))
-                        return
-                result_queue.put(("error", err))
-            except Exception as e:
-                logger.error(f"未知错误: {e}")
-                result_queue.put(("error", e))
-                
-        thread = threading.Thread(target=_execute)
-        thread.start()
-        return thread
-
-    def _execute_serial(self, serial: List[Tuple[int, str]]) -> Tuple[bool, Optional[int], List[Tuple]]:
-        """使用多个独立连接按序执行事务场景
-        
-        Args:
-            serial: 死锁场景的执行序列，格式为[(事务ID, SQL语句), ...]
-        
-        Returns:
-            Tuple[bool, Optional[int], List[Tuple]]: 是否成功执行所有语句(死锁或错误会返回False), 回滚的事务ID, 执行序列
-        """
-
-        try:
-            self._init_connections()
-                
-            # 记录每个事务当前执行到的位置
-            idx = 0
-            executed_serial = []
-
-            pending_stmts = {}
-            result_queues = {}
-            
-            # 记录被阻塞的事务ID
-            rollback_trx_ids = set()
-            blocked_trx_ids = set()
-            blocked_stmts = {}
-
-            serial = self.serial if serial is None else serial
-            while idx < len(serial) or pending_stmts:
-                try:
-                    if idx >= len(serial):
-                        logger.info(f"序列遍历完成，开始查看剩余阻塞的语句：{pending_stmts}")
-                    
-                    # 启动新的语句执行
-                    if idx < len(serial):
-                        trx_id, stmt = serial[idx]
-                        if stmt is None:
-                            print(f"stmt为None, trx_id: {trx_id}, stmt: {stmt}")
-                            logger.error(f"stmt为None, trx_id: {trx_id}, stmt: {stmt}")
-                            idx += 1
-                            continue
-
-                        # 如果该事务已被标记为blocked，跳过不执行
-                        if rollback_trx_ids and trx_id in rollback_trx_ids:
-                            executed_serial.append((trx_id, f"--Skipped, trx_id: {trx_id}, stmt: {stmt}"))
-                            idx += 1
-                            continue
-                            
-                        if blocked_trx_ids and trx_id in blocked_trx_ids:
-                            # 先不给他分配线程，加入等待队列blocked_stmts
-                            blocked_stmts[idx] = (trx_id, stmt)
-                            idx += 1
-                            continue
-
-                        # 处理事务控制语句
-                        if stmt.strip().upper() in ("BEGIN", "COMMIT"):
-                            with self.conn_locks[trx_id]:
-                                cursor = self.connections[trx_id].cursor()
-                                try:
-                                    cursor.execute(stmt)
-                                    executed_serial.append((trx_id, stmt))
-                                except Exception as e:
-                                    logger.error(f"事务控制语句执行失败: {e}")
-                                cursor.close()
-                            idx += 1
-                            continue
-                        
-                        # 为新语句创建结果队列并启动执行
-                        result_queue = queue.Queue()
-                        thread = self.execute_stmt_async(trx_id, stmt, result_queue)
-                        pending_stmts[idx] = (trx_id, stmt, thread, time.time())
-                        result_queues[idx] = result_queue
-                        idx += 1
-                    
-                    # 检查所有pending语句的执行结果
-                    logger.info("")
-                    logger.info(f"执行前idx: {idx}, pending_stmts: {pending_stmts}")
-                    
-                    completed_stmts = []
-                    
-                    stmt_indices = list(pending_stmts.keys())
-                    for stmt_idx in stmt_indices:
-                        try:
-                            # 非阻塞方式检查结果
-                            time.sleep(0.1)
-                            trx_id, stmt, thread, _ = pending_stmts[stmt_idx]
-                            status, result = result_queues[stmt_idx].get_nowait()
-                            logger.info(f"stmt_idx: {stmt_idx}, status: {status}, result: {result}")
-                            
-                            if status == "success":
-                                executed_serial.append((trx_id, stmt))
-                                logger.info(f"成功执行序列中事务{trx_id}语句: {stmt}")
-                                completed_stmts.append(stmt_idx)
-                                del pending_stmts[stmt_idx]
-                                del result_queues[stmt_idx]
-
-                                if blocked_trx_ids and trx_id in blocked_trx_ids:
-                                    # 结束了阻塞
-                                    logger.info(f"结束了阻塞，blocked_trx_ids: {blocked_trx_ids}, stmt: {stmt}")
-                                    blocked_trx_ids.remove(trx_id)
-                                    for stmt_idx, (trx_id, stmt) in blocked_stmts.items():
-                                        # 分配线程
-                                        result_queue = queue.Queue()
-                                        thread = self.execute_stmt_async(trx_id, stmt, result_queue)
-                                        pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
-                                        result_queues[stmt_idx] = result_queue
-                                        
-                            elif status == "error":
-                                if result.errno == 1213:  # 死锁
-                                    logger.error(f"死锁错误: {result}，事务{trx_id}语句: {stmt}")
-                                    rollback_trx_ids.add(trx_id)
-                                    executed_serial.append((trx_id, "ROLLBACK"))
-                                    completed_stmts.append(stmt_idx)
-                                    # 终止那个被回滚的事务的pending线程们
-                                    for stmt_idx, (trx_id, stmt, thread, _) in pending_stmts.items():
-                                        if trx_id in rollback_trx_ids:
-                                            thread.join(timeout=0.001)
-                                            del pending_stmts[stmt_idx]
-                                            del result_queues[stmt_idx]
-                                    # 继续执行,让未被回滚的事务完成
-                                else:
-                                    executed_serial.append((trx_id, f"-- Error: {stmt}"))
-                                    logger.error(f"执行语句失败，非死锁错误: {result}，事务{trx_id}语句: {stmt}")
-                                    return False, trx_id, executed_serial
-                        except queue.Empty:
-                            # 说明wait for lock
-                            print(f"wait for lock, trx_id: {trx_id}, stmt: {stmt}")
-                            logger.info(f"wait for lock, trx_id: {trx_id}, stmt: {stmt}")
-                            blocked_trx_ids.add(trx_id)  # 标记为blocked
-                            continue
-                    
-                    # 短暂休眠避免CPU占用过高
-                    logger.info(f"执行后idx: {idx}, pending_stmts: {pending_stmts}")
-                    logger.info("")
-                    time.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"错误: {e}")
-            
-            # 所有语句执行完毕后,根据是否发生死锁返回结果
-            if rollback_trx_ids:
-                return False, rollback_trx_ids, executed_serial
-            return True, None, executed_serial
-        
-        except Exception as e:
-            logger.error(f"执行序列发生错误: {e}")
-            print(f"执行序列发生错误: {e}")
-            return False, None, []
-        finally:
-            # 清理资源
-            for conn in self.connections.values():
-                try:
-                    conn.close()
-                except Exception as e:
-                    logger.error(f"关闭连接失败: {e}")
-
-    def _restore_initial_state(self) -> bool:
-        """还原数据库到初始状态"""
-        conn = None
-        cursor = None
-        try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor(buffered=True)
-            
-            # 还原表数据
-            cursor.execute(f"TRUNCATE TABLE {self.table_name}")
-            cursor.execute(f"""
-                INSERT INTO {self.table_name} (id, col_0)
-                VALUES {', '.join([f'({i}, 0)' for i in range(1, self.total_rows_num + 1)])}
-            """)
-            conn.commit()
-            return True
-            
-        except mysql.connector.Error as err:
-            logger.error(f"还原初始状态失败: {err}")
-            return False
-            
-        finally:
-            if cursor:
-                try:
-                    cursor.close()
-                except:
-                    pass
-            if conn:
-                try:
-                    if conn.is_connected():
-                        conn.close()
-                except:
-                    pass
-
-    # def _generate_all_serials(self, trx_sqls: Dict[int, List[str]], 
-    #                      committed_trxs: Set[int], 
-    #                      rolled_back_trxs: Set[int]) -> List[List[Tuple[int, str]]]:
-    #     """
-    #     生成所有可能的执行序列
-        
-    #     Args:
-    #         trx_sqls: 事务SQL语句字典 {事务ID: [SQL语句列表]}
-    #         committed_trxs: 成功提交的事务ID集合
-    #         rolled_back_trxs: 被回滚的事务ID集合
-        
-    #     Returns:
-    #         List[List[Tuple[int, str]]]: 所有可能的执行序列列表
-    #     """
-    #     try:
-    #         # 只考虑成功提交的事务
-    #         valid_trxs = committed_trxs - rolled_back_trxs
-    #         if not valid_trxs:
-    #             return []
-
-    #         # 构建每个事务的语句序列
-    #         trx_sequences = {}
-    #         for trx_id in valid_trxs:
-    #             if trx_id in trx_sqls:
-    #                 sequence = []
-    #                 sequence.append((trx_id, "BEGIN"))
-    #                 for stmt in trx_sqls[trx_id]:
-    #                     sequence.append((trx_id, stmt))
-    #                 sequence.append((trx_id, "COMMIT"))
-    #                 trx_sequences[trx_id] = sequence
-
-    #         # 使用递归生成所有可能的序列组合
-    #         def generate_combinations(remaining_trxs: Set[int], current_serial: List[Tuple[int, str]], 
-    #                                 result: List[List[Tuple[int, str]]]):
-    #             if not remaining_trxs:
-    #                 result.append(current_serial[:])
-    #                 return
-                
-    #             # 对于每个剩余的事务，尝试将其完整序列插入当前位置
-    #             for trx_id in remaining_trxs:
-    #                 # 将当前事务的所有语句添加到序列中
-    #                 new_serial = current_serial + trx_sequences[trx_id]
-    #                 # 递归处理剩余事务
-    #                 generate_combinations(
-    #                     remaining_trxs - {trx_id}, 
-    #                     new_serial, 
-    #                     result
-    #                 )
-
-    #         all_serials = []
-    #         generate_combinations(valid_trxs, [], all_serials)
-
-    #         # 生成交错执行的序列
-    #         def generate_interleaved_serials(trx_sequences: Dict[int, List[Tuple[int, str]]]) -> List[List[Tuple[int, str]]]:
-    #             # 获取所有事务的语句
-    #             all_stmts = []
-    #             for trx_id, sequence in trx_sequences.items():
-    #                 all_stmts.extend(sequence)
-                
-    #             # 使用递归生成所有可能的交错序列
-    #             def generate_valid_permutations(remaining_stmts: List[Tuple[int, str]], 
-    #                                          current_serial: List[Tuple[int, str]],
-    #                                          trx_states: Dict[int, str],
-    #                                          result: List[List[Tuple[int, str]]]):
-    #                 if not remaining_stmts:
-    #                     result.append(current_serial[:])
-    #                     return
-                    
-    #                 # 找出当前可以执行的语句
-    #                 for i, (trx_id, stmt) in enumerate(remaining_stmts):
-    #                     can_execute = False
-                        
-    #                     # 检查事务状态
-    #                     if stmt == "BEGIN":
-    #                         can_execute = trx_id not in trx_states
-    #                     elif stmt == "COMMIT":
-    #                         can_execute = trx_states.get(trx_id) == "ACTIVE"
-    #                     else:
-    #                         can_execute = trx_states.get(trx_id) == "ACTIVE"
-                        
-    #                     if can_execute:
-    #                         # 更新事务状态
-    #                         new_trx_states = trx_states.copy()
-    #                         if stmt == "BEGIN":
-    #                             new_trx_states[trx_id] = "ACTIVE"
-    #                         elif stmt == "COMMIT":
-    #                             new_trx_states[trx_id] = "COMMITTED"
-                            
-    #                         # 递归生成剩余序列
-    #                         new_remaining = remaining_stmts[:i] + remaining_stmts[i+1:]
-    #                         generate_valid_permutations(
-    #                             new_remaining,
-    #                             current_serial + [(trx_id, stmt)],
-    #                             new_trx_states,
-    #                             result
-    #                         )
-
-    #             interleaved_serials = []
-    #             generate_valid_permutations(all_stmts, [], {}, interleaved_serials)
-    #             return interleaved_serials
-
-    #         # 合并顺序执行和交错执行的序列
-    #         all_serials.extend(generate_interleaved_serials(trx_sequences))
-
-    #         # 移除重复的序列
-    #         unique_serials = []
-    #         seen = set()
-    #         for serial in all_serials:
-    #             serial_tuple = tuple(serial)
-    #             if serial_tuple not in seen:
-    #                 seen.add(serial_tuple)
-    #                 unique_serials.append(serial)
-
-    #         return unique_serials
-
-    #     except Exception as e:
-    #         logger.error(f"生成执行序列失败: {e}")
-    #         return []
-
-    def check_atomicity(self, trx_sqls: Dict[int, List[str]], 
-                       serial: List[Tuple[int, str]], 
-                       ) -> Tuple[bool, str, List[Tuple[int, str]]]:
-        """检查事务序列的原子性"""
-        try:
-            logger.info(f"执行序列: {serial}")
-            logger.info(f"trx_sqls: {trx_sqls}")
-
-            try:
-                conn = self._create_connection()
-                self.snapshot_before = self._take_snapshot(conn)
-                conn.close()
-                
-                # 执行原始序列
-                success, rollback_trx_ids, executed_serial = self._execute_serial(serial)
-            except Exception as e:
-                logger.error(f"执行序列失败: {e}")
-                return False, str(e), []
-                
-            # 如果执行成功且没有回滚的事务，即未发生死锁，直接返回，这个测例无效，如果发生死锁，才需要检查原子性
-            if success and rollback_trx_ids is None:
-                logger.info(f"执行序列成功，未发生死锁，无效test case")
-                print(f"执行序列成功，未发生死锁，无效test case")
-                return True, None, serial
-
-            # 保存并发执行后的数据库状态
-            conn = self._create_connection()
-            self.snapshot_serial = self._take_snapshot(conn)
-            conn.close()
-
-            # 获取成功和失败的事务集合
-            rolled_back_trxs = set(rollback_trx_ids) if rollback_trx_ids else set()
-            committed_trxs = {trx_id for trx_id, sql in executed_serial if sql.upper() == "COMMIT"}
-            self.executed_serial = executed_serial
-                        
-            logger.info(f"被回滚的事务: {sorted(list(rolled_back_trxs))}")
-            logger.info(f"成功提交的事务: {sorted(list(committed_trxs))}")
-            
-            cleaned_serial = []
-            for trx_id, stmt in executed_serial:
-                if trx_id in rolled_back_trxs:
-                    cleaned_serial.append((trx_id, stmt))
-            
-            # 检查cleaned_serial是否等价于serial
-            self._restore_initial_state()
-            cleaned_success, cleaned_rollback_trx_ids, cleaned_executed_serial = self._execute_serial(cleaned_serial)
-
-            if not cleaned_success:
-                error_msg = "清理后的序列执行失败，这可能表明存在原子性问题"
-                logger.error(error_msg)
-                return False, error_msg, cleaned_serial
-                
-            # 获取清理后序列的执行状态
-            conn = self._create_connection()
-            clean_state = self._take_snapshot(conn)
-            conn.close()
-            
-            # 比较两次执行的结果
-            if not self._compare_snapshots(self.snapshot_serial, clean_state):
-                error_msg = (
-                    "违反原子性：\n"
-                    f"serial执行状态: {self.snapshot_serial}\n"
-                    f"cleaned_serial执行状态: {clean_state}"
-                )
-                logger.error(error_msg)
-                return False, error_msg, cleaned_serial
-            return True, None, serial
-            
-        except Exception as e:
-            logger.error(f"检查原子性过程发生错误: {e}")
-            return False, str(e), []
+        """初始化事务连接"""
+        self.conn1 = mysql.connector.connect(**self.db_config)
+        self.conn2 = mysql.connector.connect(**self.db_config)
 
     def _create_connection(self):
         """创建数据库连接"""
@@ -1838,74 +1379,352 @@ class AtomicityChecker:
             logger.error("")
             raise
 
-    def _execute_transaction(self, conn: mysql.connector.MySQLConnection, 
-                           statements: List[str], trx_id: int) -> bool:
-        """
-        执行单个事务的所有语句
-        
-        Args:
-            conn: 数据库连接
-            statements: SQL语句列表
-            trx_id: 事务ID
-        
-        Returns:
-            bool: 是否成功执行所有语句
-        """
+    def _execute_transaction(self, conn, statements: List[str], trx_id: int) -> bool:
         try:
             cursor = conn.cursor()
             for stmt in statements:
-                if stmt.strip().upper() == "BEGIN":
-                    cursor.execute("BEGIN")
-                elif stmt.strip().upper() == "COMMIT":
-                    cursor.execute("COMMIT")
-                else:
+                if stmt:
                     cursor.execute(stmt)
                     if stmt.strip().upper().startswith("SELECT"):
                         cursor.fetchall()
+                    logger.info(f"执行事务{trx_id}语句: {stmt}")  # 记录执行成功的SQL
+            conn.commit()
             cursor.close()
             return True
-        except Exception as e:
-            logger.error(f"执行事务{trx_id}失败: {e}")
-            try:
-                conn.rollback()
-            except:
-                pass
+        except mysql.connector.Error as err:
+            # conn.rollback()
+            cursor.close()
+            logger.error(f"执行SQL失败: {stmt}")  # 记录失败的SQL
+            logger.error(f"错误详情: {err}")
             return False
 
-    def _restore_initial_state(self) -> bool:
-        """还原数据库到初始状态"""
-        conn = None
-        cursor = None
+    def execute_stmt_async(self, trx_id, stmt, result_queue):
+        """异步执行SQL语句"""
+        def _execute():
+            # nonlocal cursor
+            # nonlocal conn
+            conn = self.conn1 if trx_id == 1 else self.conn2
+            lock = self.conn_locks[trx_id]
+            try:
+                with lock:
+                    cursor = conn.cursor(buffered=True)
+                    cursor.execute(stmt)
+                    if stmt.strip().upper().startswith("SELECT"):
+                        cursor.fetchall()
+                result_queue.put(("success", None))
+                cursor.close()
+            except mysql.connector.Error as err:
+                logger.error(f"执行语句错误: {err}, stmt: {stmt}")
+                # 检查是否是连接丢失错误
+                if err.errno == 2013 or "Lost connection" in str(err):
+                    try:
+                        # 重新连接
+                        cursor.close()
+                        conn.reconnect(attempts=3, delay=1)
+                        cursor = conn.cursor(buffered=True)
+                        # 重试执行语句
+                        cursor.execute(stmt)
+                        if stmt.strip().upper().startswith("SELECT"):
+                            cursor.fetchall()
+                        result_queue.put(("success", None))
+                        logger.info(f"重连执行成功, stmt: {stmt}")
+                        return
+                    except mysql.connector.Error as reconnect_err:
+                        logger.error(f"重连执行失败: {reconnect_err}, stmt: {stmt}")
+                        result_queue.put(("error", reconnect_err))
+                        return
+                result_queue.put(("error", err))
+            except Exception as e:
+                logger.error(f"未知错误: {e}")
+                result_queue.put(("error", e))
+                
+        thread = threading.Thread(target=_execute)
+        # thread.daemon = True
+        thread.start()
+        # thread.join(timeout=1)
+        return thread
+    
+    def _execute_serial(self) -> Tuple[bool, Optional[int], List[Tuple]]:
+        """使用两个独立连接按序执行死锁场景"""
+
         try:
-            # 创建新连接
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor(buffered=True)
+            self._init_connections()
+                
+            # 记录每个事务当前执行到的位置
+            idx = 0
+            executed_serial = []
+
+            pending_stmts = {}
+            result_queues = {}
             
-            # 还原表数据
-            cursor.execute(f"TRUNCATE TABLE {self.table_name}")
-            cursor.execute(f"""
-                INSERT INTO {self.table_name} (id, col_0)
-                VALUES {', '.join([f'({i}, 0)' for i in range(1, self.total_rows_num + 1)])}
-            """)
-            conn.commit()
-            return True
-            
-        except mysql.connector.Error as err:
-            logger.error(f"还原初始状态失败: {err}")
-            return False
-            
-        finally:
-            if cursor:
+            # 记录被阻塞的事务ID
+            rollback_trx_id = None
+            blocked_trx_id = None
+            blocked_stmts = {}
+
+            while idx < len(self.serial) or pending_stmts:
                 try:
-                    cursor.close()
+                    if idx >= len(self.serial):
+                        logger.info(f"序列遍历完成，开始查看剩余阻塞的语句：{pending_stmts}")
+                    
+                    # 启动新的语句执行
+                    if idx < len(self.serial):
+                        trx_id, stmt = self.serial[idx]
+                        if stmt is None:
+                            print(f"stmt为None, trx_id: {trx_id}, stmt: {stmt}")
+                            logger.error(f"stmt为None, trx_id: {trx_id}, stmt: {stmt}")
+                            idx += 1
+                            continue
+
+                        # 如果该事务已被标记为blocked，跳过不执行
+                        if rollback_trx_id and trx_id == rollback_trx_id:
+                            executed_serial.append((trx_id, f"--Skipped, trx_id: {trx_id}, stmt: {stmt}"))
+                            idx += 1
+                            continue
+                            
+                        if blocked_trx_id and trx_id == blocked_trx_id:
+                            # 先不给他分配线程，加入等待队列blocked_stmts
+                            blocked_stmts[idx] = (trx_id, stmt)
+                            idx += 1
+                            continue
+
+                        if stmt.strip().upper() == "BEGIN":
+                            with self.conn_locks[trx_id]:
+                                cursor = self.conn1.cursor() if trx_id == 1 else self.conn2.cursor()
+                                try:
+                                    cursor.execute("BEGIN")
+                                    executed_serial.append((trx_id, "BEGIN"))
+                                except Exception as e:
+                                    logger.error(f"开始事务失败: {e}")
+                                cursor.close()
+                            idx += 1
+                            continue
+                        if stmt.strip().upper() == "COMMIT":
+                            with self.conn_locks[trx_id]:
+                                cursor = self.conn1.cursor() if trx_id == 1 else self.conn2.cursor()
+                                try:
+                                    cursor.execute("COMMIT")
+                                    executed_serial.append((trx_id, "COMMIT"))
+                                except Exception as e:
+                                    logger.error(f"提交事务失败: {e}")
+                                cursor.close()
+                            idx += 1
+                            continue
+                        
+                        # 为新语句创建结果队列并启动执行
+                        result_queue = queue.Queue()
+                        thread = self.execute_stmt_async(trx_id, stmt, result_queue)
+                        pending_stmts[idx] = (trx_id, stmt, thread, time.time())
+                        result_queues[idx] = result_queue
+                        idx += 1
+                    
+                    # 检查所有pending语句的执行结果
+                    logger.info("")
+                    logger.info(f"执行前idx: {idx}, pending_stmts: {pending_stmts}")
+                    
+                    completed_stmts = []
+                    
+                    stmt_indices = list(pending_stmts.keys())
+                    for stmt_idx in stmt_indices:
+                        try:
+                            # 非阻塞方式检查结果
+                            time.sleep(0.1)
+                            trx_id, stmt, thread, _ = pending_stmts[stmt_idx]
+                            status, result = result_queues[stmt_idx].get_nowait()
+                            logger.info(f"stmt_idx: {stmt_idx}, status: {status}, result: {result}")
+                            if status == "success":
+                                executed_serial.append((trx_id, stmt))
+                                logger.info(f"成功执行序列中事务{trx_id}语句: {stmt}")
+                                completed_stmts.append(stmt_idx)
+                                del pending_stmts[stmt_idx]
+                                del result_queues[stmt_idx]
+
+                                if blocked_trx_id and trx_id == blocked_trx_id:
+                                    # 结束了阻塞
+                                    logger.info(f"结束了阻塞，blocked_trx_id: {blocked_trx_id}, stmt: {stmt}")
+                                    blocked_trx_id = None
+                                    for stmt_idx, (trx_id, stmt) in blocked_stmts.items():
+                                        # 分配线程
+                                        result_queue = queue.Queue()
+                                        thread = self.execute_stmt_async(trx_id, stmt, result_queue)
+                                        pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
+                                        result_queues[stmt_idx] = result_queue
+                                        
+                            elif status == "error":
+                                if result.errno == 1213:  # 死锁
+                                    logger.error(f"死锁错误: {result}，事务{trx_id}语句: {stmt}")
+                                    # 获取实际被回滚的事务ID
+                                    # rollback_trx_id = get_deadlock_info()
+                                    rollback_trx_id = trx_id
+                                    executed_serial.append((rollback_trx_id, "ROLLBACK"))
+                                    completed_stmts.append(stmt_idx)
+                                    # 终止那个被回滚的事务的pending线程们
+                                    for stmt_idx, (trx_id, stmt, thread, _) in pending_stmts.items():
+                                        if trx_id == rollback_trx_id:
+                                            thread.join(timeout=0.001)
+                                            del pending_stmts[stmt_idx]
+                                            del result_queues[stmt_idx]
+                                    # 继续执行,让未被回滚的事务完成
+                                else:
+                                    executed_serial.append((trx_id, f"-- Error: {stmt}"))
+                                    logger.error(f"执行语句失败，非死锁错误: {result}，事务{trx_id}语句: {stmt}")
+                                    return False, trx_id, executed_serial
+                        except queue.Empty:
+                            # 说明wait for lock
+                            print(f"wait for lock, trx_id: {trx_id}, stmt: {stmt}")
+                            logger.info(f"wait for lock, trx_id: {trx_id}, stmt: {stmt}")
+                            blocked_trx_id = trx_id # 标记为blocked
+                            continue
+                    
+                    # 短暂休眠避免CPU占用过高
+                    logger.info(f"执行后idx: {idx}, pending_stmts: {pending_stmts}")
+                    logger.info("")
+                    time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"错误: {e}")
+            
+
+            # 所有语句执行完毕后,根据是否发生死锁返回结果
+            if rollback_trx_id:
+                return False, rollback_trx_id, executed_serial
+            return True, None, executed_serial
+        
+        except Exception as e:
+            logger.error(f"执行序列发生错误: {e}")
+            print(f"执行序列发生错误: {e}")
+            return False, None, []
+        finally:
+            # 清理资源
+            if self.conn1:
+                try:
+                    self.conn1.close()
+                except Exception as e:
+                    logger.error(f"关闭事务1连接失败: {e}")
+                    pass
+            if self.conn2:
+                try:
+                    self.conn2.close()
+                except Exception as e:
+                    logger.error(f"关闭事务2连接失败: {e}")
+                    pass
+
+    def _compare_snapshots(self, snapshot1: Dict[str, List[Tuple]], 
+                          snapshot2: Dict[str, List[Tuple]]) -> bool:
+        """比较两个数据库快照是否相同，忽略自增ID的差异"""
+        if snapshot1.keys() != snapshot2.keys():
+            return False
+        
+        for table_name in snapshot1.keys():
+            rows1 = snapshot1[table_name]
+            rows2 = snapshot2[table_name]
+            
+            # 检查行数是否相同
+            if len(rows1) != len(rows2):
+                return False
+            
+            # TODO: 目前忽略的auto_increment列，后续需要考虑
+            # 比较每一行，忽略ID（第一列）
+            for row1, row2 in zip(rows1, rows2):
+                # 比较除ID外的所有列
+                if row1[1:] != row2[1:]:
+                    return False
+        
+        return True
+    
+    def _restore_initial_state(self, conn):
+        """彻底恢复数据库到初始状态，包括重建表结构和重置自增序列"""
+        try:
+            # 首先确保所有已有连接都被清理
+            self._cleanup_all_connections()
+            
+            # 创建新连接
+            new_conn = mysql.connector.connect(**self.db_config)
+            cursor = new_conn.cursor()
+            
+            # # 设置更短的超时时间
+            # cursor.execute("SET SESSION innodb_lock_wait_timeout = 3")
+            # cursor.execute("SET SESSION wait_timeout = 5")
+            
+            # 强制结束所有活跃事务
+            cursor.execute("""
+                SELECT trx_id, trx_mysql_thread_id 
+                FROM information_schema.innodb_trx
+            """)
+            for trx_id, thread_id in cursor.fetchall():
+                try:
+                    cursor.execute(f"KILL {thread_id}")
                 except:
                     pass
+                
+            # 等待一小段时间确保事务真正结束
+            time.sleep(1)
+            
+            # 获取所有表名
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = %s
+            """, (self.db_config['database'],))
+            tables = cursor.fetchall()
+            
+            # 禁用外键检查
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+            
+            # 删除并重建每个表
+            for (table_name,) in tables:
+                try:
+                    # 先获取表的创建语句
+                    cursor.execute(f"SHOW CREATE TABLE {table_name}")
+                    _, create_stmt = cursor.fetchone()
+                    
+                    # 尝试删除表
+                    for attempt in range(3):
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                            new_conn.commit()
+                            break
+                        except Exception as e:
+                            if attempt == 2:  # 最后一次尝试失败
+                                raise
+                            time.sleep(1)
+                    
+                    # 重新创建表
+                    cursor.execute(create_stmt)
+                    new_conn.commit()
+                    
+                except Exception as e:
+                    logger.error(f"处理表 {table_name} 时发生错误: {e}")
+                    raise
+            
+            # 重新启用外键检查
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+            
+            # 重新插入初始数据
+            if hasattr(self, 'snapshot_before') and self.snapshot_before:
+                for table_name, rows in self.snapshot_before.items():
+                    for row in rows:
+                        placeholders = ','.join(['%s'] * len(row))
+                        cursor.execute(
+                            f"INSERT INTO {table_name} VALUES ({placeholders})",
+                            row
+                        )
+            
+            new_conn.commit()
+            cursor.close()
+            
+            # 如果原连接还在，关闭它
             if conn:
                 try:
-                    if conn.is_connected():
-                        conn.close()
+                    conn.close()
                 except:
                     pass
+            
+            return new_conn
+            
+        except Exception as e:
+            logger.error(f"恢复初始状态时发生错误: {e}")
+            logger.error("")
+            raise
 
     def _cleanup_all_connections(self):
         """清理所有数据库连接和事务"""
@@ -1932,10 +1751,83 @@ class AtomicityChecker:
         except Exception as e:
             logger.warning(f"清理连接时发生错误: {e}")
 
+    def check_atomicity(self) -> Tuple[bool, str]:
+        """
+        检查事务的原子性
+        
+        Returns:
+            Tuple[bool, str]: (是否满足原子性, 详细信息)
+        """
+        try:
+            # 获取初始状态的快照
+            conn = self._create_connection()
+            self.snapshot_before = self._take_snapshot(conn)
+            conn.close()
+
+            # 执行事务1
+            conn = self._create_connection()
+            logger.info(f"创建事务1连接成功")
+            trx1_success = self._execute_transaction(conn, self.trx1, 1)
+            self.snapshot_trx1 = self._take_snapshot(conn)
+            conn.close()
+            logger.info(f"执行事务1成功") if trx1_success else logger.error(f"执行事务1失败")
+
+            # 执行事务2
+            
+            
+            self._restore_initial_state(conn)
+            logger.info(f"恢复初始状态成功")
+            conn = self._create_connection()
+            logger.info(f"创建事务2连接成功")
+            trx2_success = self._execute_transaction(conn, self.trx2, 2)
+            self.snapshot_trx2 = self._take_snapshot(conn)
+            conn.close()
+            logger.info(f"执行事务2成功") if trx2_success else logger.error(f"执行事务2失败")
+
+
+            conn = self._create_connection()
+            self._restore_initial_state(conn)
+            
+            serial_success, rollback_trx_id, executed_serial = self._execute_serial()
+            self.executed_serial = executed_serial
+            logger.info(f"执行序列成功")
+            
+            # 使用新连接获取最终状态快照
+            conn = self._create_connection()
+            self.snapshot_serial = self._take_snapshot(conn)
+            
+            # 关闭所有连接
+            conn.close()
+
+            # 检查是否是无效的测试用例
+            if serial_success is True:
+                return True, "序列被完整成功执行，无效的测试用例：未发生死锁或锁等待"
+            
+            # 检查结果
+            if not serial_success:  # 发生死锁，某个事务被回滚
+                if rollback_trx_id == 1:
+                    # 事务1被回滚，检查事务2的结果
+                    if self._compare_snapshots(self.snapshot_serial, self.snapshot_trx2):
+                        return True, "死锁发生，事务1被回滚，事务2的结果与单独执行时一致，满足原子性"
+                    else:
+                        return False, "死锁发生，事务1被回滚，但最终状态与事务2单独执行的结果不一致，不满足原子性"
+                else:  # rollback_trx_id == 2
+                    # 事务2被回滚，检查事务1的结果
+                    if self._compare_snapshots(self.snapshot_serial, self.snapshot_trx1):
+                        return True, "死锁发生，事务2被回滚，事务1的结果与单独执行时一致，满足原子性"
+                    else:
+                        return False, "死锁发生，事务2被回滚，但最终状态与事务1单独执行的结果不一致，不满足原子性"
+
+        except Exception as e:
+            logger.error(f"检查原子性失败: {e}")
+            return False, f"检查过程发生错误: {str(e)}"
+
     def get_snapshots(self) -> Dict[str, Dict[str, List[Tuple]]]:
         """获取所有快照数据，用于调试"""
         return {
             "before": self.snapshot_before,
+            "trx1": self.snapshot_trx1,
+            "trx2": self.snapshot_trx2,
             "serial": self.snapshot_serial
         }
 
@@ -1948,38 +1840,6 @@ class AtomicityChecker:
         # 移除可能的引号差异
         sql = sql.replace('"', "'")
         return sql
-
-    def _compare_snapshots(self, snapshot1: Dict[str, List[Tuple]], 
-                          snapshot2: Dict[str, List[Tuple]]) -> bool:
-        """
-        比较两个数据库快照是否相同
-        
-        Args:
-            snapshot1: 第一个快照
-            snapshot2: 第二个快照
-        
-        Returns:
-            bool: 两个快照是否相同
-        """
-        try:
-            if snapshot1.keys() != snapshot2.keys():
-                return False
-                
-            for table_name in snapshot1.keys():
-                if len(snapshot1[table_name]) != len(snapshot2[table_name]):
-                    return False
-                
-                # 对行进行排序以确保比较的一致性
-                rows1 = sorted(snapshot1[table_name])
-                rows2 = sorted(snapshot2[table_name])
-                
-                if rows1 != rows2:
-                    return False
-                    
-            return True
-        except Exception as e:
-            logger.error(f"比较快照失败: {e}")
-            return False
 
 
 # 修改连接池配置
@@ -2009,44 +1869,54 @@ dbconfig = {
 try:
     conn = mysql.connector.connect(**dbconfig)
     cursor = conn.cursor()
-    cursor.execute("SET GLOBAL innodb_lock_wait_timeout = 10")
+    cursor.execute("SET GLOBAL innodb_lock_wait_timeout = 600000")
     cursor.execute("SET GLOBAL net_write_timeout = 600000")
     cursor.execute("SET GLOBAL net_read_timeout = 600000")
     # 设置隔离级别
-    cursor.execute("set global transaction isolation level REPEATABLE READ")
+    cursor.execute("set global transaction isolation level READ COMMITTED")
+    # 设置全局超时参数
+    # cursor.execute("SET GLOBAL wait_timeout = 180")
+    # cursor.execute("SET GLOBAL interactive_timeout = 180")
     cursor.close()
     conn.close()
 except mysql.connector.Error as err:
     logger.warning(f"设置锁等待超时失败: {err}")
 
 # 进行实验
-num_of_runs = 1
+num_of_runs = 100
 logger.info("INFO TEST")
 logger.debug("DEBUG TEST")
 logger.error("ERROR TEST")
 bug_count = 1
-
-isolation_level = "RR"
 for i in range(num_of_runs):
     # 添加日志记录
     print(f"iter: {i}") 
     logger.info(f"iter: {i}")
     conn = None
     try:
-        # 创建数据库连接
+        # 从连接池获取连接
+        # conn = connection_pool.get_connection()
         conn = mysql.connector.connect(**dbconfig)
         
         # 使用同一个连接初始化
         initializer = MySQLInitializer(
-            connection=conn,
+            connection=conn,  # 传入连接而不是创建新连接
             database="test"
         )
         
         # 初始化数据库
         initializer.initialize_database()
+
+        # 创建表
         initializer.generate_tables()
+
+        # 插入数据
         initializer.populate_tables()
+
+        # 执行随机化操作
         initializer.execute_random_actions()
+
+        # 提交并关闭连接
         initializer.commit_and_close()
 
         # 生成死锁场景
@@ -2056,36 +1926,35 @@ for i in range(num_of_runs):
         total_rows_num = cursor.fetchone()[0]
         cursor.close()
 
-        # 创建死锁生成器，设置事务数量为3-5之间的随机数
-        num_transactions = random.randint(3, 5)
-        dlGenerator = DeadlockGenerator(
-            isolation_level, LOCK_HIERARCHY, RR_Template, total_rows_num, 
-            "localhost", "root", "123456", "test", 3308,
-            num_transactions=num_transactions
-        )
-        
-        # 生成死锁场景
-        trx_sqls, serial = dlGenerator.generate_deadlock()
+        dlGenerator = DeadlockGenerator("RR", LOCK_HIERARCHY, RR_Template, total_rows_num, "localhost", "root", "123456", "test", 3308)
+        res_dict, lock_same_resource = dlGenerator._init_resource_distribution()
+        print(dlGenerator.trx1_lock_rows_num, dlGenerator.trx2_lock_rows_num, dlGenerator.intersection_size)
 
-        # 创建原子性检查器
-        atomicity_checker = AtomicityChecker(
-            "localhost", "root", "123456", "test", 3308, isolation_level,
-            trx_sqls, serial
-        )
-        
-        # 检查原子性
-        is_atomic, info, executed_serial = atomicity_checker.check_atomicity(trx_sqls, serial)
-        snapshots = atomicity_checker.get_snapshots()
+        logger.info(f"res_dict: {res_dict}")
+        logger.info(f"trx1_continuous: {dlGenerator.trx1_lock_rows_continuous},trx2_continuous: {dlGenerator.trx2_lock_rows_continuous}")
+        logger.info(f"lock_same_resource: {lock_same_resource}")
+        logger.info("")
+
+        # 生成事务
+        trx1, trx2, serial = dlGenerator._generate_deadlock_trx_serial(10)
+
+        # 进行实验
+        atomicity_checker = AtomicityChecker("localhost", "root", "123456", "test", 3308, trx1, trx2, serial)
+        is_atomic, info = atomicity_checker.check_atomicity()
+
         print('is_atomic:', is_atomic)
+        print()
         print('info:', info)
-        print('executed_serial:', executed_serial)
-        print('snapshots:', snapshots)
+        print()
+        print('executed_serial:', atomicity_checker.executed_serial)
+        print()
+        print('snapshots:', atomicity_checker.get_snapshots())
         print()
 
         logger.info(f"is_atomic: {is_atomic}")
         logger.info(f"info: {info}")
-        logger.info(f"executed_serial: {executed_serial}")
-        logger.info(f"snapshots: {snapshots}")
+        logger.info(f"executed_serial: {atomicity_checker.executed_serial}")
+        logger.info(f"snapshots: {atomicity_checker.get_snapshots()}")
         logger.info("")
 
         if not is_atomic:
@@ -2094,53 +1963,81 @@ for i in range(num_of_runs):
             bug_count += 1
             os.makedirs(bug_case_dir, exist_ok=True)
             
-            # 导出数据库状态
-            atomicity_checker._restore_initial_state()
+            # 先还原数据库到初始状态
+            conn = mysql.connector.connect(**dbconfig)
+            conn = atomicity_checker._restore_initial_state(conn)  # 使用返回的新连接
+            conn.close()
             
+            # 导出还原后的数据库状态
             dump_cmd = f"mysqldump -h localhost -P 3308 -u root -p123456 test > {bug_case_dir}/initial_state.sql"
             os.system(dump_cmd)
 
+            
             # 保存事务和序列信息
             with open(f"{bug_case_dir}/transactions.sql", 'w') as f:
-                for trx_id, sqls in trx_sqls.items():
-                    f.write(f"-- Transaction {trx_id}\n")
-                    f.write("\n".join(sqls) + "\n\n")
+                f.write("-- Transaction 1\n")
+                f.write("\n".join(trx1) + "\n\n")
+                f.write("-- Transaction 2\n")
+                f.write("\n".join(trx2) + "\n\n")
                 f.write("-- Planned Serial\n")
                 f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in serial]) + "\n\n")
                 f.write("-- Actually Executed Serial\n")
-                f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in executed_serial]))
+                f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in atomicity_checker.executed_serial]))
             
             # 记录其他相关信息
             with open(f"{bug_case_dir}/metadata.txt", 'w') as f:
-                f.write(f"Number of Transactions: {num_transactions}\n")
                 f.write(f"Bug Info: {info}\n")
-                f.write(f"Distribution Mode: {dlGenerator.distribution_mode}\n")
-                f.write(f"Resource Distribution: {dlGenerator.trx_resources}\n")
-                f.write(f"Snapshots: {snapshots}\n")
+                f.write(f"Resource Distribution: {res_dict}\n")
+                f.write(f"Lock Same Resource: {lock_same_resource}\n")
+                f.write(f"T1 Continuous: {dlGenerator.trx1_lock_rows_continuous}\n")
+                f.write(f"T2 Continuous: {dlGenerator.trx2_lock_rows_continuous}\n")
+                f.write(f"T1 Lock Row IDs: {dlGenerator.trx1_lock_row_ids}\n")
+                f.write(f"T2 Lock Row IDs: {dlGenerator.trx2_lock_row_ids}\n")
+                f.write(f"Intersection IDs: {getattr(dlGenerator, 'intersection_ids', 'None')}\n")
+                f.write(f"T1 Exclusive IDs: {getattr(dlGenerator, 'trx1_exclusive_ids', 'None')}\n")
+                f.write(f"T2 Exclusive IDs: {getattr(dlGenerator, 'trx2_exclusive_ids', 'None')}\n")
+                f.write(f"Snapshots: {atomicity_checker.get_snapshots()}\n")
             
-            # 记录日志
+            # 继续记录日志
             logger.error(f"BUG FOUND: {info}")
-            logger.info(f"Number of Transactions: {num_transactions}")
-            logger.info(f"Distribution Mode: {dlGenerator.distribution_mode}")
-            logger.info(f"Resource Distribution: {dlGenerator.trx_resources}")
-            logger.info(f"Transactions: {trx_sqls}")
-            logger.info(f"Planned Serial: {serial}")
-            logger.info(f"Actually Executed Serial: {executed_serial}")
-            logger.info(f"Snapshots: {snapshots}")
+            logger.info(f"iter: {i}")
+            logger.info(f"resource distribution: {res_dict}")
+            logger.info(f"lock same resource: {lock_same_resource}")
+            logger.info(f"T1是否连续：{dlGenerator.trx1_lock_rows_continuous}")
+            logger.info(f"T2是否连续：{dlGenerator.trx2_lock_rows_continuous}")
+            logger.info(f"事务1锁定的行ID：{dlGenerator.trx1_lock_row_ids}")
+            logger.info(f"事务2锁定的行ID：{dlGenerator.trx2_lock_row_ids}")
+            logger.info(f"交集行ID：{getattr(dlGenerator, 'intersection_ids', 'None')}")
+            logger.info(f"事务1独占行：{getattr(dlGenerator, 'trx1_exclusive_ids', 'None')}")
+            logger.info(f"事务2独占行：{getattr(dlGenerator, 'trx2_exclusive_ids', 'None')}")
+            logger.info(f"事务1：{trx1}")
+            logger.info(f"事务2：{trx2}")
+            logger.info(f"序列：{serial}")
+            logger.info(f"实际执行序列：{atomicity_checker.executed_serial}")
+            logger.info(f"快照：{atomicity_checker.get_snapshots()}")
             logger.info("")
 
             print(f"BUG FOUND: {info}")
-            print(f"Number of Transactions: {num_transactions}")
-            print(f"Distribution Mode: {dlGenerator.distribution_mode}")
-            print(f"Resource Distribution: {dlGenerator.trx_resources}")
-            print(f"Transactions: {trx_sqls}")
-            print(f"Planned Serial: {serial}")
-            print(f"Actually Executed Serial: {executed_serial}")
-            print(f"Snapshots: {snapshots}")
+            print(f"iter: {i}")
+            print(f"resource distribution: {res_dict}")
+            print(f"lock same resource: {lock_same_resource}")
+            print(f"T1是否连续：{dlGenerator.trx1_lock_rows_continuous}")
+            print(f"T2是否连续：{dlGenerator.trx2_lock_rows_continuous}")
+            print(f"事务1锁定的行ID：{dlGenerator.trx1_lock_row_ids}")
+            print(f"事务2锁定的行ID：{dlGenerator.trx2_lock_row_ids}")
+            print(f"交集行ID：{getattr(dlGenerator, 'intersection_ids', 'None')}")
+            print(f"事务1独占行：{getattr(dlGenerator, 'trx1_exclusive_ids', 'None')}")
+            print(f"事务2独占行：{getattr(dlGenerator, 'trx2_exclusive_ids', 'None')}")
+            print(f"事务1：{trx1}")
+            print(f"事务2：{trx2}")
+            print(f"序列：{serial}")
+            print(f"实际执行序列：{atomicity_checker.executed_serial}")
+            print(f"快照：{atomicity_checker.get_snapshots()}")
             print("")
             continue
 
     except Exception as e:
+        # 已有对应的日志记录
         print(f"Error in iteration {i}: {e}")
         print("")
         logger.error(f"Error in iteration {i}: {e}")
