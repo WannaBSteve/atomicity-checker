@@ -6,6 +6,9 @@ from MySQLInitializer import MySQLInitializer
 from MySQLParameter import SQLParamGenerator
 from MySQLTemplateGen import MySQLTemplateGen
 from MySQLASTGen import MySQLASTGen
+from Transaction import Transaction
+from statement_cell import StatementCell
+
 import logging
 import re
 import os
@@ -15,6 +18,7 @@ import queue
 import itertools
 import threading
 import mysql
+
 
 log_filename = 'atomicity-checker.log'
 if not os.path.exists(log_filename):
@@ -319,12 +323,15 @@ class DeadlockGenerator:
     def _generate_deadlock_trx_serial(self, max_statements: int) -> Tuple[Dict[int, List[str]], List[Tuple]]:
         """生成死锁事务序列"""
         try:
+            logger.info("开始生成死锁事务序列")
+            
             # 初始化每个事务的SQL列表
-            self.trx_sqls = {i: ["BEGIN"] for i in range(self.num_transactions)}
-            serial = [(i, "BEGIN") for i in range(self.num_transactions)]
+            self.trx_sqls = {i: ["BEGIN"] for i in range(1, self.num_transactions + 1)}
+            serial = [(i, "BEGIN") for i in range(1, self.num_transactions + 1)]
+            logger.debug(f"初始化事务SQL列表: {self.trx_sqls}")
             
             # 第一阶段：每个事务锁定自己的独占资源
-            for i in range(self.num_transactions):
+            for i in range(1, self.num_transactions + 1):
                 if self.trx_resources[i]['exclusive_ids']:
                     lock_type = random.choice(["S", "X"])  # 简化锁类型选择
                     if self.trx_resources[i]['continuous']:
@@ -340,7 +347,7 @@ class DeadlockGenerator:
                     serial.append((i, sql))
             
             # 第二阶段：每个事务请求其他事务的共享资源
-            for i in range(self.num_transactions):
+            for i in range(1, self.num_transactions + 1):
                 if self.trx_resources[i]['shared_ids']:
                     lock_type = random.choice(["S", "X"])  # 简化锁类型选择
                     for shared_id in self.trx_resources[i]['shared_ids']:
@@ -351,7 +358,7 @@ class DeadlockGenerator:
                         serial.append((i, sql))
             
             # 添加提交语句
-            for i in range(self.num_transactions):
+            for i in range(1, self.num_transactions + 1):
                 self.trx_sqls[i].append("COMMIT")
                 serial.append((i, "COMMIT"))
                 
@@ -422,58 +429,6 @@ class DeadlockGenerator:
             logger.error(f"生成死锁场景失败: {e}")
             raise
 
-    def execute_deadlock_serial(self, serial: List[Tuple[int, str]]) -> Tuple[bool, List[int]]:
-        """
-        执行死锁序列
-        
-        Args:
-            serial: 执行序列，每个元素为(事务ID, SQL语句)的元组
-        
-        Returns:
-            Tuple[bool, List[int]]: (是否成功执行完所有语句, 被回滚的事务ID列表)
-        """
-        try:
-            print("开始执行死锁序列")
-            logger.info("开始执行死锁序列")
-            
-            rollback_trxs = []
-            executed_statements = []
-            
-            for trx_id, sql in serial:
-                print(f"执行事务{trx_id}: {sql}")
-                logger.info(f"执行事务{trx_id}: {sql}")
-                
-                try:
-                    if sql.upper() == "BEGIN":
-                        continue
-                    elif sql.upper() == "COMMIT":
-                        self.connections[trx_id].commit()
-                    else:
-                        self.cursors[trx_id].execute(sql)
-                    executed_statements.append((trx_id, sql))
-                    
-                except mysql.connector.Error as err:
-                    print(f"事务{trx_id}执行失败: {err}")
-                    logger.error(f"事务{trx_id}执行失败: {err}")
-                    
-                    if err.errno == 1213:  # 死锁错误码
-                        rollback_trxs.append(trx_id)
-                        self.connections[trx_id].rollback()
-                        print(f"事务{trx_id}被回滚")
-                        logger.info(f"事务{trx_id}被回滚")
-                    else:
-                        raise
-            
-            success = len(rollback_trxs) > 0
-            print(f"执行完成，成功状态: {success}, 被回滚的事务: {rollback_trxs}")
-            logger.info(f"执行完成，成功状态: {success}, 被回滚的事务: {rollback_trxs}")
-            
-            return success, rollback_trxs
-            
-        except Exception as e:
-            logger.error(f"执行死锁序列失败: {e}")
-            raise
-
     def _get_table_metadata(self) -> Tuple[List[str], List[str], List[str], List[str]]:
         """获取表的元数据信息
         
@@ -534,14 +489,14 @@ class DeadlockGenerator:
                 logger.info(f"选择资源分配模式: {self.distribution_mode}")
                 
                 # 随机决定每个事务是连续还是离散锁定
-                self.trx_continuous = {i: random.choice([True, False]) for i in range(self.num_transactions)}
+                self.trx_continuous = {i: random.choice([True, False]) for i in range(1, self.num_transactions + 1)}
                 
                 result = {}
                 all_rows = set(range(1, self.total_rows_num + 1))
                 available_rows = all_rows.copy()
                 
                 # 为每个事务分配独占资源
-                for i in range(self.num_transactions):
+                for i in range(1, self.num_transactions + 1):
                     if len(available_rows) < 1:
                         logger.warning(f"尝试 {attempt + 1}: 没有足够的资源分配给事务{i}")
                         break
@@ -556,9 +511,11 @@ class DeadlockGenerator:
                         'shared_ids': [],
                         'continuous': self.trx_continuous[i]
                     }
+                    logger.debug(f"事务{i}的资源分配: {result[i]}")
                 
                 # 如果所有事务都获得了独占资源，继续分配共享资源
                 if len(result) == self.num_transactions:
+                    logger.info("所有事务都获得了独占资源，开始分配共享资源")
                     success = False
                     
                     if self.distribution_mode == "chain":
@@ -570,17 +527,21 @@ class DeadlockGenerator:
                     
                     if success:
                         self.trx_resources = result
-                        logger.info(f"资源分配结果: {result}")
-                        logger.info(f"分配模式: {self.distribution_mode}")
+                        logger.info(f"资源分配成功: {result}")
                         return result, True
                         
-                logger.warning(f"尝试 {attempt + 1}: 资源分配失败")
-                
+                    logger.warning(f"尝试 {attempt + 1}: 资源分配失败")
+                    
+                logger.warning(f"尝试 {attempt + 1}: 资源分配出错: {str(e)}")
+                logger.error(f"错误类型: {type(e)}")
+                continue
+            
             except Exception as e:
-                logger.error(f"尝试 {attempt + 1}: 资源分配出错: {e}")
+                logger.error(f"尝试 {attempt + 1}: 资源分配出错: {str(e)}")
+                logger.error(f"错误类型: {type(e)}")
                 continue
         
-        raise Exception("资源分配失败：达到最大尝试次数")
+        raise ValueError("资源分配失败：达到最大尝试次数")
 
     def _add_chain_shared_resources(self, result: Dict, available_rows: Set[int]) -> bool:
         """添加链式共享资源，不使用递归"""
@@ -589,7 +550,7 @@ class DeadlockGenerator:
                 return False
                 
             # 为每对相邻事务添加共享资源
-            for i in range(self.num_transactions):
+            for i in range(1, self.num_transactions + 1):
                 next_trx = (i + 1) % self.num_transactions
                 
                 if len(available_rows) < 1:
@@ -619,7 +580,7 @@ class DeadlockGenerator:
             self.center_trx = random.randint(0, self.num_transactions - 1)
             
             # 为中心事务和每个其他事务添加共享资源
-            for other_trx in range(self.num_transactions):
+            for other_trx in range(1, self.num_transactions + 1):
                 if other_trx == self.center_trx:
                     continue
                     
@@ -647,8 +608,8 @@ class DeadlockGenerator:
         """添加网状共享资源，不使用递归"""
         try:
             # 随机生成事务间的共享关系
-            for i in range(self.num_transactions):
-                for j in range(i + 1, self.num_transactions):
+            for i in range(1, self.num_transactions + 1):
+                for j in range(i + 1, self.num_transactions + 1):
                     if random.random() < 0.5 and len(available_rows) > 0:  # 50%概率生成共享关系
                         shared_size = random.randint(1, min(2, len(available_rows)))
                         shared_rows = set(random.sample(list(available_rows), shared_size))
@@ -1369,26 +1330,41 @@ class AtomicityChecker:
         self.snapshot_before = None
         self.snapshot_serial = None
         self.executed_serial = None
-        
+        self.rollback_trx_ids = set()
+        self.result_queue = None
+        self.txs = None
+        self.terminate_events = {}
+
         # 为每个事务创建连接和锁
         self.connections = {}
         self.conn_locks = {}
-        for i in range(self.num_transactions):
+        for i in range(1, self.num_transactions + 1):
             self.conn_locks[i] = threading.Lock()
 
-    def _init_connections(self):
+    def _init_connections(self, actual_trx_ids: Set[int]):
         """为每个事务创建独立的数据库连接"""
-        for trx_id in range(self.num_transactions):
+        # 首先将self.connections清空
+        self.connections = {}
+        # 然后重新初始化
+        for trx_id in actual_trx_ids:
             if trx_id not in self.connections:
                 conn = mysql.connector.connect(**self.db_config)
                 cursor = conn.cursor()
                 cursor.execute(f"SET SESSION TRANSACTION ISOLATION LEVEL {ISOLATION_LEVELS[self.isolation_level]}")
                 cursor.close()
                 self.connections[trx_id] = conn
+        logger.info(f"初始化连接完成, connections: {self.connections}")
 
-    def execute_stmt_async(self, trx_id: int, stmt: str, result_queue: queue.Queue):
+    def _cleanup_connections(self, actual_trx_ids: Set[int]):
+        """清理所有连接"""
+        for trx_id in actual_trx_ids:
+            self.connections[trx_id].close()
+
+    def execute_stmt_async(self, trx_id: int, stmt: str, result_queue: queue.Queue, terminate_event: threading.Event):
         """异步执行SQL语句"""
         def _execute():
+            nonlocal trx_id
+            nonlocal stmt
             conn = self.connections[trx_id]
             lock = self.conn_locks[trx_id]
             try:
@@ -1400,32 +1376,35 @@ class AtomicityChecker:
                 result_queue.put(("success", None))
                 cursor.close()
             except mysql.connector.Error as err:
-                logger.error(f"执行语句错误: {err}, stmt: {stmt}")
-                if err.errno == 2013 or "Lost connection" in str(err):
-                    try:
-                        cursor.close()
-                        conn.reconnect(attempts=3, delay=1)
-                        cursor = conn.cursor(buffered=True)
-                        cursor.execute(stmt)
-                        if stmt.strip().upper().startswith("SELECT"):
-                            cursor.fetchall()
-                        result_queue.put(("success", None))
-                        logger.info(f"重连执行成功, stmt: {stmt}")
-                        return
-                    except mysql.connector.Error as reconnect_err:
-                        logger.error(f"重连执行失败: {reconnect_err}, stmt: {stmt}")
-                        result_queue.put(("error", reconnect_err))
-                        return
+                if err.errno == 1213:
+                    logger.error(f"     异步执行死锁: {err}, stmt: {stmt}")
+                    terminate_event.set()
+                else:
+                    logger.error(f"     异步执行非死锁错误: {err}, stmt: {stmt}")
+                
+                # TODO: 终止那个被回滚的事务的pending线程们，但是目前这样的实现完全线程不安全
+                # if err.errno == 1213:  # 死锁
+                #     for stmt_idx, (trx_id, stmt, thread, _) in self.pending_stmts.items():
+                #         if trx_id in self.rollback_trx_ids:
+                #             thread.join(timeout=0.001)
+                #         del self.pending_stmts[stmt_idx]
+                #         del self.result_queues[stmt_idx]
+                #         logger.info(f"      终止事务{trx_id}的pending语句: {stmt}")
                 result_queue.put(("error", err))
             except Exception as e:
-                logger.error(f"未知错误: {e}")
+                logger.error(f"     异步执行未知错误: {e}")
                 result_queue.put(("error", e))
+            finally:
+                if terminate_event.is_set():
+                    logger.info(f"      终止事务{trx_id}的pending语句: {stmt}")
+                    return
                 
         thread = threading.Thread(target=_execute)
         thread.start()
         return thread
+    
 
-    def _execute_serial(self, serial: List[Tuple[int, str]]) -> Tuple[bool, Optional[int], List[Tuple]]:
+    def _execute_serial(self, serial: List[Tuple[int, str]], cleaned: bool) -> Tuple[bool, Optional[int], List[Tuple[int, str]], List[Tuple[int, str]]]:
         """使用多个独立连接按序执行事务场景
         
         Args:
@@ -1436,126 +1415,164 @@ class AtomicityChecker:
         """
 
         try:
-            self._init_connections()
-                
+            actual_trx_ids = set(tx_id for tx_id, _ in serial)
+            self._init_connections(actual_trx_ids)
+            # 有几个事务就创建几个terminate_event
+            self.terminate_events = {trx_id: threading.Event() for trx_id in actual_trx_ids}
+
             # 记录每个事务当前执行到的位置
             idx = 0
             executed_serial = []
+            logged_serial = []
 
-            pending_stmts = {}
-            result_queues = {}
-            
+            self.pending_stmts = {}
+            self.result_queues = {}
+            self.rollback_trx_ids = set()
+
             # 记录被阻塞的事务ID
             rollback_trx_ids = set()
             blocked_trx_ids = set()
             blocked_stmts = {}
 
             serial = self.serial if serial is None else serial
-            while idx < len(serial) or pending_stmts:
+            while idx < len(serial) or self.pending_stmts:
+                logger.info(f"idx: {idx}")
+                # 如果阻塞语句队列能被调度，优先执行阻塞的语句
+                blocked_stmts_copy = blocked_stmts.copy()
+                logger.info(f"首先检查是否可调度阻塞语句")
+                for stmt_idx, (trx_id, stmt) in blocked_stmts_copy.items():
+                    if trx_id not in blocked_trx_ids:
+                        # 为那些阻塞结束的事务分配线程
+                        result_queue = queue.Queue()
+                        terminate_event = self.terminate_events[trx_id]
+                        thread = self.execute_stmt_async(trx_id, stmt, result_queue, terminate_event)
+                        self.pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
+                        self.result_queues[stmt_idx] = result_queue
+                        logger.info(f"调度阻塞语句成功，blocked_stmts: {blocked_stmts}")
+                        del blocked_stmts[stmt_idx]
+                logger.info("")
+
                 try:
                     if idx >= len(serial):
-                        logger.info(f"序列遍历完成，开始查看剩余阻塞的语句：{pending_stmts}")
+                        logger.info(f"序列遍历完成，开始查看剩余阻塞的语句：{self.pending_stmts}")
                     
                     # 启动新的语句执行
                     if idx < len(serial):
                         trx_id, stmt = serial[idx]
                         if stmt is None:
-                            print(f"stmt为None, trx_id: {trx_id}, stmt: {stmt}")
                             logger.error(f"stmt为None, trx_id: {trx_id}, stmt: {stmt}")
                             idx += 1
                             continue
 
-                        # 如果该事务已被标记为blocked，跳过不执行
+                        # 如果该事务已被回滚，跳过不执行
                         if rollback_trx_ids and trx_id in rollback_trx_ids:
-                            executed_serial.append((trx_id, f"--Skipped, trx_id: {trx_id}, stmt: {stmt}"))
+                            # executed_serial.append((trx_id, f"--Skipped, trx_id: {trx_id}, stmt: {stmt}"))
+                            logged_serial.append((trx_id, f"--Skipped, trx_id: {trx_id}, stmt: {stmt}"))
                             idx += 1
                             continue
                             
+                        # 如果该事务当前已被阻塞
                         if blocked_trx_ids and trx_id in blocked_trx_ids:
                             # 先不给他分配线程，加入等待队列blocked_stmts
                             blocked_stmts[idx] = (trx_id, stmt)
                             idx += 1
                             continue
-
-                        # 处理事务控制语句
-                        if stmt.strip().upper() in ("BEGIN", "COMMIT"):
-                            with self.conn_locks[trx_id]:
-                                cursor = self.connections[trx_id].cursor()
-                                try:
-                                    cursor.execute(stmt)
-                                    executed_serial.append((trx_id, stmt))
-                                except Exception as e:
-                                    logger.error(f"事务控制语句执行失败: {e}")
-                                cursor.close()
-                            idx += 1
-                            continue
                         
                         # 为新语句创建结果队列并启动执行
                         result_queue = queue.Queue()
-                        thread = self.execute_stmt_async(trx_id, stmt, result_queue)
-                        pending_stmts[idx] = (trx_id, stmt, thread, time.time())
-                        result_queues[idx] = result_queue
+                        terminate_event = self.terminate_events[trx_id]
+                        thread = self.execute_stmt_async(trx_id, stmt, result_queue, terminate_event)
+                        self.pending_stmts[idx] = (trx_id, stmt, thread, time.time())
+                        self.result_queues[idx] = result_queue
                         idx += 1
                     
                     # 检查所有pending语句的执行结果
                     logger.info("")
-                    logger.info(f"执行前idx: {idx}, pending_stmts: {pending_stmts}")
+                    logger.info(f"执行前idx: {idx}, pending_stmts: {self.pending_stmts}")
                     
-                    completed_stmts = []
                     
-                    stmt_indices = list(pending_stmts.keys())
+                    stmt_indices = list(self.pending_stmts.keys())
                     for stmt_idx in stmt_indices:
-                        try:
-                            # 非阻塞方式检查结果
-                            time.sleep(0.1)
-                            trx_id, stmt, thread, _ = pending_stmts[stmt_idx]
-                            status, result = result_queues[stmt_idx].get_nowait()
-                            logger.info(f"stmt_idx: {stmt_idx}, status: {status}, result: {result}")
-                            
-                            if status == "success":
-                                executed_serial.append((trx_id, stmt))
-                                logger.info(f"成功执行序列中事务{trx_id}语句: {stmt}")
-                                completed_stmts.append(stmt_idx)
-                                del pending_stmts[stmt_idx]
-                                del result_queues[stmt_idx]
-
-                                if blocked_trx_ids and trx_id in blocked_trx_ids:
-                                    # 结束了阻塞
-                                    logger.info(f"结束了阻塞，blocked_trx_ids: {blocked_trx_ids}, stmt: {stmt}")
-                                    blocked_trx_ids.remove(trx_id)
-                                    for stmt_idx, (trx_id, stmt) in blocked_stmts.items():
-                                        # 分配线程
-                                        result_queue = queue.Queue()
-                                        thread = self.execute_stmt_async(trx_id, stmt, result_queue)
-                                        pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
-                                        result_queues[stmt_idx] = result_queue
-                                        
-                            elif status == "error":
-                                if result.errno == 1213:  # 死锁
-                                    logger.error(f"死锁错误: {result}，事务{trx_id}语句: {stmt}")
-                                    rollback_trx_ids.add(trx_id)
-                                    executed_serial.append((trx_id, "ROLLBACK"))
-                                    completed_stmts.append(stmt_idx)
-                                    # 终止那个被回滚的事务的pending线程们
-                                    for stmt_idx, (trx_id, stmt, thread, _) in pending_stmts.items():
-                                        if trx_id in rollback_trx_ids:
-                                            thread.join(timeout=0.001)
-                                            del pending_stmts[stmt_idx]
-                                            del result_queues[stmt_idx]
-                                    # 继续执行,让未被回滚的事务完成
-                                else:
-                                    executed_serial.append((trx_id, f"-- Error: {stmt}"))
-                                    logger.error(f"执行语句失败，非死锁错误: {result}，事务{trx_id}语句: {stmt}")
-                                    return False, trx_id, executed_serial
-                        except queue.Empty:
+                        # 非阻塞方式检查结果
+                        time.sleep(0.1)
+                        trx_id, stmt, thread, _ = self.pending_stmts[stmt_idx]
+                        # status, result = self.result_queues[stmt_idx].get_nowait()
+                        result_queue = self.result_queues[stmt_idx]
+                        if result_queue.empty():
                             # 说明wait for lock
                             print(f"wait for lock, trx_id: {trx_id}, stmt: {stmt}")
                             logger.info(f"wait for lock, trx_id: {trx_id}, stmt: {stmt}")
-                            blocked_trx_ids.add(trx_id)  # 标记为blocked
+                            try:
+                                blocked_trx_ids.add(trx_id)  # 标记为blocked
+                            except:
+                                logger.error(f"添加blocked_trx_ids失败, trx_id: {trx_id}")
                             continue
+                        
+                        # 从result_queue中获取结果
+                        status, result = result_queue.get_nowait()
+                        
+                        if status == "success":
+                            executed_serial.append((trx_id, stmt))
+                            logged_serial.append((trx_id, stmt))
+                            logger.info(f"成功执行序列中事务{trx_id}语句: {stmt}")
+                            del self.pending_stmts[stmt_idx]
+                            del self.result_queues[stmt_idx]
+
+                            if blocked_trx_ids and trx_id in blocked_trx_ids:
+                                # 结束了阻塞
+                                logger.info(f"结束了阻塞，blocked_trx_ids: {blocked_trx_ids}, stmt: {stmt}")
+                                blocked_trx_ids.remove(trx_id)
+                                    
+                        elif status == "error":
+                            if result.errno == 1213:  # 死锁
+                                # # 终止那个被回滚的事务的pending线程们
+                                # pending_stmts_copy = self.pending_stmts.copy()
+                                # for stmt_idx, (trx_id, stmt, thread, _) in pending_stmts_copy.items():
+                                #     if trx_id in rollback_trx_ids:
+                                #         thread.join(timeout=0.001)
+                                #         del self.pending_stmts[stmt_idx]
+                                #         del self.result_queues[stmt_idx]
+                                #         logger.info(f"终止事务{trx_id}的pending语句: {stmt}")
+                                                    # 删除pending_stmts和result_queues中对应的元素
+
+                                pending_stmts_copy = self.pending_stmts.copy()
+                                for stmt_idx, (trx_id1, stmt1, thread1, _) in pending_stmts_copy.items():
+                                    if trx_id1 == trx_id:
+                                        del self.pending_stmts[stmt_idx]
+                                        del self.result_queues[stmt_idx]
+
+                                # 移除那个被回滚事务的blocking语句
+                                blocked_stmts_copy = blocked_stmts.copy()
+                                for stmt_idx, (trx_id, stmt) in blocked_stmts_copy.items():
+                                    if trx_id in rollback_trx_ids:
+                                        del blocked_stmts[stmt_idx]
+                                
+                                logger.error(f"死锁错误: {result}，事务{trx_id}语句: {stmt}")
+                                rollback_trx_ids.add(trx_id)
+                                # 如果不是cleaned_serial，即是serial的执行
+                                if not cleaned:
+                                    self.rollback_trx_ids = rollback_trx_ids
+                                executed_serial.append((trx_id, "ROLLBACK"))
+                                logged_serial.append((trx_id, f"-- Cause Deadlock, Rollback. {stmt}"))
+
+                                # 继续执行,让未被回滚的事务完成
+                            elif result.errno == 1062:  # 重复键
+                                logger.error(f"重复键错误: {result}，事务{trx_id}语句: {stmt}")
+                                # executed_serial.append((trx_id, f"-- Error and skipped: {stmt}"))
+                                logged_serial.append((trx_id, f"-- Error and skipped: {stmt}"))
+                                # 跳过该语句,并终止该事务的pending线程
+                                thread.join(timeout=0.001)
+                                del self.pending_stmts[stmt_idx]
+                                del self.result_queues[stmt_idx]
+                            else:
+                                # executed_serial.append((trx_id, f"-- Error: {stmt}"))
+                                logged_serial.append((trx_id, f"-- Error: {stmt}"))
+                                logger.error(f"执行语句失败，非死锁错误: {result}，事务{trx_id}语句: {stmt}")
+                                return False, trx_id, executed_serial, logged_serial
+                    
                     
                     # 短暂休眠避免CPU占用过高
-                    logger.info(f"执行后idx: {idx}, pending_stmts: {pending_stmts}")
+                    logger.info(f"执行后idx: {idx}, pending_stmts: {self.pending_stmts}")
                     logger.info("")
                     time.sleep(0.1)
                 except Exception as e:
@@ -1563,13 +1580,14 @@ class AtomicityChecker:
             
             # 所有语句执行完毕后,根据是否发生死锁返回结果
             if rollback_trx_ids:
-                return False, rollback_trx_ids, executed_serial
-            return True, None, executed_serial
+                return False, rollback_trx_ids, executed_serial, logged_serial
+            else:
+                return True, set(), executed_serial, logged_serial
         
         except Exception as e:
             logger.error(f"执行序列发生错误: {e}")
             print(f"执行序列发生错误: {e}")
-            return False, None, []
+            return False, set(), [], []
         finally:
             # 清理资源
             for conn in self.connections.values():
@@ -1578,162 +1596,200 @@ class AtomicityChecker:
                 except Exception as e:
                     logger.error(f"关闭连接失败: {e}")
 
-    def _restore_initial_state(self) -> bool:
-        """还原数据库到初始状态"""
-        conn = None
-        cursor = None
-        try:
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor(buffered=True)
-            
-            # 还原表数据
-            cursor.execute(f"TRUNCATE TABLE {self.table_name}")
-            cursor.execute(f"""
-                INSERT INTO {self.table_name} (id, col_0)
-                VALUES {', '.join([f'({i}, 0)' for i in range(1, self.total_rows_num + 1)])}
-            """)
-            conn.commit()
-            return True
-            
-        except mysql.connector.Error as err:
-            logger.error(f"还原初始状态失败: {err}")
-            return False
-            
-        finally:
-            if cursor:
-                try:
-                    cursor.close()
-                except:
-                    pass
-            if conn:
-                try:
-                    if conn.is_connected():
-                        conn.close()
-                except:
-                    pass
-
-    # def _generate_all_serials(self, trx_sqls: Dict[int, List[str]], 
-    #                      committed_trxs: Set[int], 
-    #                      rolled_back_trxs: Set[int]) -> List[List[Tuple[int, str]]]:
-    #     """
-    #     生成所有可能的执行序列
+    # def _execute_serial(self, serial: List[Tuple[int, str]], cleaned: bool) -> Tuple[bool, Optional[Set[int]], List[Tuple[int, str]]]:
+    #     """使用多线程执行事务序列
         
     #     Args:
-    #         trx_sqls: 事务SQL语句字典 {事务ID: [SQL语句列表]}
-    #         committed_trxs: 成功提交的事务ID集合
-    #         rolled_back_trxs: 被回滚的事务ID集合
+    #         serial: 死锁场景的执行序列，格式为[(事务ID, SQL语句), ...]
+    #         cleaned: 是否是清理后的序列
         
     #     Returns:
-    #         List[List[Tuple[int, str]]]: 所有可能的执行序列列表
+    #         Tuple[bool, Set[int], List[Tuple], List[Tuple]]: 
+    #         (是否成功执行所有语句, 回滚的事务ID集合, 实际执行序列, 日志序列)
     #     """
     #     try:
-    #         # 只考虑成功提交的事务
-    #         valid_trxs = committed_trxs - rolled_back_trxs
-    #         if not valid_trxs:
-    #             return []
+    #         logger.info(f"---------------初始化-----------------")
+    #         actual_trx_ids = set(tx_id for tx_id, _ in serial)
+    #         logger.info(f"序列包含事务ID集合: {actual_trx_ids}")
 
-    #         # 构建每个事务的语句序列
-    #         trx_sequences = {}
-    #         for trx_id in valid_trxs:
-    #             if trx_id in trx_sqls:
-    #                 sequence = []
-    #                 sequence.append((trx_id, "BEGIN"))
-    #                 for stmt in trx_sqls[trx_id]:
-    #                     sequence.append((trx_id, stmt))
-    #                 sequence.append((trx_id, "COMMIT"))
-    #                 trx_sequences[trx_id] = sequence
+    #         self._init_connections(actual_trx_ids)
+    #         logger.info(f"初始化连接成功")
 
-    #         # 使用递归生成所有可能的序列组合
-    #         def generate_combinations(remaining_trxs: Set[int], current_serial: List[Tuple[int, str]], 
-    #                                 result: List[List[Tuple[int, str]]]):
-    #             if not remaining_trxs:
-    #                 result.append(current_serial[:])
-    #                 return
-                
-    #             # 对于每个剩余的事务，尝试将其完整序列插入当前位置
-    #             for trx_id in remaining_trxs:
-    #                 # 将当前事务的所有语句添加到序列中
-    #                 new_serial = current_serial + trx_sequences[trx_id]
-    #                 # 递归处理剩余事务
-    #                 generate_combinations(
-    #                     remaining_trxs - {trx_id}, 
-    #                     new_serial, 
-    #                     result
-    #                 )
+    #         # 为每个事务创建队列和通信队列
+    #         tx_queues = {i: queue.Queue() for i in actual_trx_ids}
+    #         logger.info(f"创建事务blocking队列成功")
+    #         comm_queue = queue.Queue()  # 用于线程间通信
+    #         logger.info(f"创建通信队列成功")
 
-    #         all_serials = []
-    #         generate_combinations(valid_trxs, [], all_serials)
+    #         # 初始化执行状态
+    #         self.txs = {i: Transaction(i) for i in actual_trx_ids}
+    #         self.executed_serial = []
+    #         self.exception_message = ""
+    #         self.is_deadlock = False
+    #         self.timeout = False
+    #         self.tx_blocks = {i: False for i in actual_trx_ids}
+    #         self.blocked_stmts = {i: [] for i in actual_trx_ids}
+    #         logger.info(f"初始化执行状态成功")
+    #         logger.info(f"---------------初始化完成-----------------")
+    #         logger.info(f"")
 
-    #         # 生成交错执行的序列
-    #         def generate_interleaved_serials(trx_sequences: Dict[int, List[Tuple[int, str]]]) -> List[List[Tuple[int, str]]]:
-    #             # 获取所有事务的语句
-    #             all_stmts = []
-    #             for trx_id, sequence in trx_sequences.items():
-    #                 all_stmts.extend(sequence)
-                
-    #             # 使用递归生成所有可能的交错序列
-    #             def generate_valid_permutations(remaining_stmts: List[Tuple[int, str]], 
-    #                                          current_serial: List[Tuple[int, str]],
-    #                                          trx_states: Dict[int, str],
-    #                                          result: List[List[Tuple[int, str]]]):
-    #                 if not remaining_stmts:
-    #                     result.append(current_serial[:])
-    #                     return
+    #         logger.info(f"---------------PRODUCER AND CONSUMER-----------------")
+    #         # 启动生产者线程
+    #         producer = threading.Thread(target=self._producer_task, 
+    #                         args=(tx_queues, comm_queue, serial))
+
+
+    #         # 启动消费者线程
+    #         consumers = []
+    #         for tx_id in actual_trx_ids:
+    #             consumer = threading.Thread(target=self._consumer_task,
+    #                             args=(tx_id, tx_queues[tx_id], comm_queue, len(serial)))
+    #             consumers.append(consumer)
+    #             consumer.start()
+    #             logger.info(f"为{tx_id}启动消费者线程成功")
+
+    #         producer.start()
+    #         logger.info(f"启动生产者线程成功")
+
+    #         producer.join()
+    #         logger.info(f"生产者线程结束")
+
+    #         # 等待所有消费者线程结束
+    #         for consumer in consumers:
+    #             consumer.join(timeout=1)
+    #             logger.info(f"消费者{tx_id}线程结束")
+
+    #         logger.info(f"---------------PRODUCER AND CONSUMER结束，序列执行完毕-----------------")
+    #         logger.info("")
+    #         if self.is_deadlock:
+    #             # 回滚所有活跃事务
+    #             for tx_id in actual_trx_ids:
+    #                 try:
+    #                     self.connections[tx_id].rollback()
+    #                 except:
+    #                     pass
+            
+    #         logger.info(f"-------结果--------")
+    #         logger.info(f"是否发生死锁: {self.is_deadlock}")
+    #         logger.info(f"回滚的事务: {self.rollback_trx_ids}")
+    #         logger.info(f"成功提交的事务: {actual_trx_ids - self.rollback_trx_ids}")
+    #         logger.info(f"实际执行序列: {self.executed_serial}")
+    #         logger.info(f"")
+    #         return (True,
+    #                 self.rollback_trx_ids if hasattr(self, 'rollback_trx_ids') else set(),
+    #                 self.executed_serial)
                     
-    #                 # 找出当前可以执行的语句
-    #                 for i, (trx_id, stmt) in enumerate(remaining_stmts):
-    #                     can_execute = False
-                        
-    #                     # 检查事务状态
-    #                     if stmt == "BEGIN":
-    #                         can_execute = trx_id not in trx_states
-    #                     elif stmt == "COMMIT":
-    #                         can_execute = trx_states.get(trx_id) == "ACTIVE"
-    #                     else:
-    #                         can_execute = trx_states.get(trx_id) == "ACTIVE"
-                        
-    #                     if can_execute:
-    #                         # 更新事务状态
-    #                         new_trx_states = trx_states.copy()
-    #                         if stmt == "BEGIN":
-    #                             new_trx_states[trx_id] = "ACTIVE"
-    #                         elif stmt == "COMMIT":
-    #                             new_trx_states[trx_id] = "COMMITTED"
-                            
-    #                         # 递归生成剩余序列
-    #                         new_remaining = remaining_stmts[:i] + remaining_stmts[i+1:]
-    #                         generate_valid_permutations(
-    #                             new_remaining,
-    #                             current_serial + [(trx_id, stmt)],
-    #                             new_trx_states,
-    #                             result
-    #                         )
-
-    #             interleaved_serials = []
-    #             generate_valid_permutations(all_stmts, [], {}, interleaved_serials)
-    #             return interleaved_serials
-
-    #         # 合并顺序执行和交错执行的序列
-    #         all_serials.extend(generate_interleaved_serials(trx_sequences))
-
-    #         # 移除重复的序列
-    #         unique_serials = []
-    #         seen = set()
-    #         for serial in all_serials:
-    #             serial_tuple = tuple(serial)
-    #             if serial_tuple not in seen:
-    #                 seen.add(serial_tuple)
-    #                 unique_serials.append(serial)
-
-    #         return unique_serials
-
     #     except Exception as e:
-    #         logger.error(f"生成执行序列失败: {e}")
-    #         return []
+    #         logger.error(f"执行序列失败: {e}")
+    #         return False, None, []
+            
+    #     finally:
+    #         self._cleanup_connections(actual_trx_ids)
 
+    # def _producer_task(self, tx_queues: Dict[int, queue.Queue], 
+    #                 comm_queue: queue.Queue, serial: List[Tuple[int, str]]):
+    #     """生产者任务：按序分发SQL语句到对应事务的队列"""
+    #     try:
+    #         for stmt_id, (tx_id, stmt) in enumerate(serial):
+    #             if stmt is None:
+    #                 continue
+                
+    #             if tx_id in self.rollback_trx_ids:
+    #                 continue
+                
+    #             # 创建语句单元
+    #             logger.info(f"  生产者任务：创建语句cell，事务{tx_id}，语句{stmt_id}，语句: {stmt}")
+    #             cell = StatementCell(self.txs[tx_id], stmt_id, stmt)
+    #             print(cell)
+                
+
+    #             # 如果事务已被阻塞，将语句加入阻塞队列
+    #             if self.tx_blocks[tx_id]:
+    #                 self.blocked_stmts[tx_id].append(cell)
+    #                 logger.info(f"  生产者任务：事务{tx_id}:{stmt}等待锁，被阻塞")
+    #                 continue
+                    
+    #             # 发送语句到对应事务的队列
+    #             tx_queues[tx_id].put(cell)
+                
+    #             # 等待执行结果
+    #             start_time = time.time()
+    #             while True:
+    #                 try:
+    #                     result = comm_queue.get(timeout=2)  # 2秒超时
+    #                     if result.statement == stmt:
+    #                         if result.blocked:
+    #                             self.tx_blocks[tx_id] = True
+    #                             self.blocked_stmts[tx_id].append(cell)
+    #                             logger.info(f"  生产者任务：事务{tx_id}:{stmt}被阻塞")
+    #                         else:
+    #                             self.executed_serial.append((tx_id, stmt))
+    #                             logger.info(f"  生产者任务：事务{tx_id}:{stmt}执行成功，结果: {result}")
+                            
+    #                         # 检查是否发生死锁
+    #                         if "deadlock" in self.exception_message.lower():
+    #                             self.is_deadlock = True
+    #                             self.rollback_trx_ids.add(tx_id)
+    #                             logger.info(f"  生产者任务：{self.exception_message}，死锁发生，回滚事务{tx_id}:{stmt}，回滚事务集合: {self.rollback_trx_ids}")
+    #                             return
+                                
+    #                         # # 处理提交或回滚后的阻塞语句
+    #                         # if stmt.upper() in ("COMMIT", "ROLLBACK"):
+    #                         #     self._handle_post_commit(tx_id, tx_queues, comm_queue)
+                                
+    #                         break
+    #                 except:
+    #                     # 超时，可能发生死锁
+    #                     self.timeout = True
+    #                     cell.blocked = True
+    #                     self.tx_blocks[tx_id] = True
+    #                     logger.info(f"  生产者任务：事务{tx_id}:{stmt}wait for lock，被阻塞")
+    #                     break
+                        
+    #     except Exception as e:
+    #         logger.error(f"生产者任务失败: {e}")
+    #     finally:
+    #         # 发送停止信号给所有消费者
+    #         for queue in tx_queues.values():
+    #             queue.put(None)
+
+    # def _consumer_task(self, tx_id: int, tx_queue: queue.Queue, 
+    #                 comm_queue: queue.Queue, total_stmts: int):
+    #     """消费者任务：执行单个事务的SQL语句"""
+    #     try:
+    #         while True:
+    #             stmt_cell = tx_queue.get()
+    #             if stmt_cell is None:  # 停止信号
+    #                 break
+                    
+    #             try:
+    #                 cursor = self.connections[tx_id].cursor()
+    #                 if stmt_cell.statement.upper().startswith("SELECT"):
+    #                     cursor.execute(stmt_cell.statement)
+    #                     stmt_cell.result = cursor.fetchall()
+    #                 else:
+    #                     cursor.execute(stmt_cell.statement)
+
+    #                 cursor.close()
+                    
+    #                 self.exception_message = ""
+                    
+    #             except mysql.connector.Error as e:
+    #                 self.exception_message = str(e)
+    #                 stmt_cell.aborted = True
+    #                 if e.errno == 1213:  # 死锁错误码
+    #                     self.rollback_trx_ids.add(tx_id)
+                        
+    #             finally:
+    #                 comm_queue.put(stmt_cell)
+                    
+    #     except Exception as e:
+    #         logger.error(f"消费者{tx_id}任务失败: {e}")
+
+            
     def check_atomicity(self, trx_sqls: Dict[int, List[str]], 
                        serial: List[Tuple[int, str]], 
-                       ) -> Tuple[bool, str, List[Tuple[int, str]]]:
+                       ) -> Tuple[bool, str, List[Tuple[int, str]], List[Tuple[int, str]]]:
         """检查事务序列的原子性"""
         try:
             logger.info(f"执行序列: {serial}")
@@ -1745,16 +1801,16 @@ class AtomicityChecker:
                 conn.close()
                 
                 # 执行原始序列
-                success, rollback_trx_ids, executed_serial = self._execute_serial(serial)
+                success, rollback_trx_ids, executed_serial, log_serial = self._execute_serial(serial, cleaned=False)
             except Exception as e:
                 logger.error(f"执行序列失败: {e}")
                 return False, str(e), []
                 
             # 如果执行成功且没有回滚的事务，即未发生死锁，直接返回，这个测例无效，如果发生死锁，才需要检查原子性
-            if success and rollback_trx_ids is None:
+            if success and len(rollback_trx_ids) == 0:
                 logger.info(f"执行序列成功，未发生死锁，无效test case")
                 print(f"执行序列成功，未发生死锁，无效test case")
-                return True, None, serial
+                return True, None, serial, []
 
             # 保存并发执行后的数据库状态
             conn = self._create_connection()
@@ -1763,45 +1819,53 @@ class AtomicityChecker:
 
             # 获取成功和失败的事务集合
             rolled_back_trxs = set(rollback_trx_ids) if rollback_trx_ids else set()
-            committed_trxs = {trx_id for trx_id, sql in executed_serial if sql.upper() == "COMMIT"}
+            # 从self.num_transactions中减去rolled_back_trxs
+            committed_trxs = set(range(1, self.num_transactions + 1)) - rolled_back_trxs
             self.executed_serial = executed_serial
                         
             logger.info(f"被回滚的事务: {sorted(list(rolled_back_trxs))}")
             logger.info(f"成功提交的事务: {sorted(list(committed_trxs))}")
             
             cleaned_serial = []
-            for trx_id, stmt in executed_serial:
-                if trx_id in rolled_back_trxs:
+            for trx_id, stmt in serial:
+                if trx_id not in rolled_back_trxs:
                     cleaned_serial.append((trx_id, stmt))
             
             # 检查cleaned_serial是否等价于serial
-            self._restore_initial_state()
-            cleaned_success, cleaned_rollback_trx_ids, cleaned_executed_serial = self._execute_serial(cleaned_serial)
+            try:
+                self._restore_initial_state()
+                logger.info("恢复初始状态成功")
+            except Exception as e:
+                logger.error(f"恢复初始状态失败: {e}")
+                return False, str(e), [], []
 
+            logger.info(f"清理后的序列: {cleaned_serial}")
+            cleaned_success, cleaned_rollback_trx_ids, cleaned_executed_serial, cleaned_log_serial = self._execute_serial(cleaned_serial, cleaned=True)
+            logger.info(f"清理后的序列执行成功: {cleaned_success}")
+            
             if not cleaned_success:
-                error_msg = "清理后的序列执行失败，这可能表明存在原子性问题"
+                error_msg = "清理后的序列仍存在死锁"
                 logger.error(error_msg)
-                return False, error_msg, cleaned_serial
                 
             # 获取清理后序列的执行状态
             conn = self._create_connection()
-            clean_state = self._take_snapshot(conn)
+            self.snapshot_cleaned = self._take_snapshot(conn)
             conn.close()
             
             # 比较两次执行的结果
-            if not self._compare_snapshots(self.snapshot_serial, clean_state):
+            if not self._compare_snapshots(self.snapshot_serial, self.snapshot_cleaned):
                 error_msg = (
                     "违反原子性：\n"
                     f"serial执行状态: {self.snapshot_serial}\n"
-                    f"cleaned_serial执行状态: {clean_state}"
+                    f"cleaned_serial执行状态: {self.snapshot_cleaned}"
                 )
                 logger.error(error_msg)
-                return False, error_msg, cleaned_serial
-            return True, None, serial
+                return False, error_msg, executed_serial, cleaned_serial
+            return True, None, executed_serial, cleaned_serial
             
         except Exception as e:
             logger.error(f"检查原子性过程发生错误: {e}")
-            return False, str(e), []
+            return False, str(e), [], []
 
     def _create_connection(self):
         """创建数据库连接"""
@@ -1872,40 +1936,100 @@ class AtomicityChecker:
                 pass
             return False
 
-    def _restore_initial_state(self) -> bool:
-        """还原数据库到初始状态"""
-        conn = None
-        cursor = None
+    def _restore_initial_state(self):
+        """彻底恢复数据库到初始状态，包括重建表结构和重置自增序列"""
         try:
+            # 首先确保所有已有连接都被清理
+            self._cleanup_all_connections()
+            
             # 创建新连接
-            conn = mysql.connector.connect(**self.db_config)
-            cursor = conn.cursor(buffered=True)
+            new_conn = mysql.connector.connect(**self.db_config)
+            cursor = new_conn.cursor()
             
-            # 还原表数据
-            cursor.execute(f"TRUNCATE TABLE {self.table_name}")
-            cursor.execute(f"""
-                INSERT INTO {self.table_name} (id, col_0)
-                VALUES {', '.join([f'({i}, 0)' for i in range(1, self.total_rows_num + 1)])}
+            # # 设置更短的超时时间
+            # cursor.execute("SET SESSION innodb_lock_wait_timeout = 3")
+            # cursor.execute("SET SESSION wait_timeout = 5")
+            
+            # 强制结束所有活跃事务
+            cursor.execute("""
+                SELECT trx_id, trx_mysql_thread_id 
+                FROM information_schema.innodb_trx
             """)
-            conn.commit()
-            return True
-            
-        except mysql.connector.Error as err:
-            logger.error(f"还原初始状态失败: {err}")
-            return False
-            
-        finally:
-            if cursor:
+            for trx_id, thread_id in cursor.fetchall():
                 try:
-                    cursor.close()
+                    cursor.execute(f"KILL {thread_id}")
                 except:
                     pass
+                
+            # 等待一小段时间确保事务真正结束
+            time.sleep(1)
+            
+            # 获取所有表名
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = %s
+            """, (self.db_config['database'],))
+            tables = cursor.fetchall()
+            
+            # 禁用外键检查
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+            
+            # 删除并重建每个表
+            for (table_name,) in tables:
+                try:
+                    # 先获取表的创建语句
+                    cursor.execute(f"SHOW CREATE TABLE {table_name}")
+                    _, create_stmt = cursor.fetchone()
+                    
+                    # 尝试删除表
+                    for attempt in range(3):
+                        try:
+                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+                            new_conn.commit()
+                            break
+                        except Exception as e:
+                            if attempt == 2:  # 最后一次尝试失败
+                                raise
+                            time.sleep(1)
+                    
+                    # 重新创建表
+                    cursor.execute(create_stmt)
+                    new_conn.commit()
+                    
+                except Exception as e:
+                    logger.error(f"处理表 {table_name} 时发生错误: {e}")
+                    raise
+            
+            # 重新启用外键检查
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+            
+            # 重新插入初始数据
+            if hasattr(self, 'snapshot_before') and self.snapshot_before:
+                for table_name, rows in self.snapshot_before.items():
+                    for row in rows:
+                        placeholders = ','.join(['%s'] * len(row))
+                        cursor.execute(
+                            f"INSERT INTO {table_name} VALUES ({placeholders})",
+                            row
+                        )
+            
+            new_conn.commit()
+            cursor.close()
+            
+            # 如果原连接还在，关闭它
             if conn:
                 try:
-                    if conn.is_connected():
-                        conn.close()
+                    conn.close()
                 except:
                     pass
+            
+            return new_conn
+            
+        except Exception as e:
+            logger.error(f"恢复初始状态时发生错误: {e}")
+            logger.error("")
+            raise
 
     def _cleanup_all_connections(self):
         """清理所有数据库连接和事务"""
@@ -1936,7 +2060,8 @@ class AtomicityChecker:
         """获取所有快照数据，用于调试"""
         return {
             "before": self.snapshot_before,
-            "serial": self.snapshot_serial
+            "serial": self.snapshot_serial,
+            "cleaned": self.snapshot_cleaned
         }
 
     def _normalize_sql(self, sql: str) -> str:
@@ -2009,7 +2134,7 @@ dbconfig = {
 try:
     conn = mysql.connector.connect(**dbconfig)
     cursor = conn.cursor()
-    cursor.execute("SET GLOBAL innodb_lock_wait_timeout = 10")
+    cursor.execute("SET GLOBAL innodb_lock_wait_timeout = 20")
     cursor.execute("SET GLOBAL net_write_timeout = 600000")
     cursor.execute("SET GLOBAL net_read_timeout = 600000")
     # 设置隔离级别
@@ -2044,9 +2169,10 @@ for i in range(num_of_runs):
         
         # 初始化数据库
         initializer.initialize_database()
-        initializer.generate_tables()
-        initializer.populate_tables()
-        initializer.execute_random_actions()
+        # initializer.generate_tables()
+        # initializer.populate_tables()
+        # initializer.execute_random_actions()
+        initializer.generate_tables_with_data_and_index()
         initializer.commit_and_close()
 
         # 生成死锁场景
@@ -2057,7 +2183,7 @@ for i in range(num_of_runs):
         cursor.close()
 
         # 创建死锁生成器，设置事务数量为3-5之间的随机数
-        num_transactions = random.randint(3, 5)
+        num_transactions = random.randint(2, 5)
         dlGenerator = DeadlockGenerator(
             isolation_level, LOCK_HIERARCHY, RR_Template, total_rows_num, 
             "localhost", "root", "123456", "test", 3308,
@@ -2074,17 +2200,19 @@ for i in range(num_of_runs):
         )
         
         # 检查原子性
-        is_atomic, info, executed_serial = atomicity_checker.check_atomicity(trx_sqls, serial)
+        is_atomic, info, executed_serial, cleaned_serial = atomicity_checker.check_atomicity(trx_sqls, serial)
         snapshots = atomicity_checker.get_snapshots()
         print('is_atomic:', is_atomic)
         print('info:', info)
         print('executed_serial:', executed_serial)
+        print('cleaned_serial:', cleaned_serial)
         print('snapshots:', snapshots)
         print()
 
         logger.info(f"is_atomic: {is_atomic}")
         logger.info(f"info: {info}")
         logger.info(f"executed_serial: {executed_serial}")
+        logger.info(f"cleaned_serial: {cleaned_serial}")
         logger.info(f"snapshots: {snapshots}")
         logger.info("")
 
@@ -2108,7 +2236,9 @@ for i in range(num_of_runs):
                 f.write("-- Planned Serial\n")
                 f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in serial]) + "\n\n")
                 f.write("-- Actually Executed Serial\n")
-                f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in executed_serial]))
+                f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in executed_serial]) + "\n\n")
+                f.write("-- Cleaned Serial\n")
+                f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in cleaned_serial]) + "\n\n")
             
             # 记录其他相关信息
             with open(f"{bug_case_dir}/metadata.txt", 'w') as f:

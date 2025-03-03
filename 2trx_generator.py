@@ -1499,7 +1499,7 @@ class AtomicityChecker:
                                 cursor.close()
                             idx += 1
                             continue
-                        if stmt.strip().upper() == "COMMIT":
+                        if stmt.strip().upper() in ("BEGIN", "COMMIT"):
                             with self.conn_locks[trx_id]:
                                 cursor = self.conn1.cursor() if trx_id == 1 else self.conn2.cursor()
                                 try:
