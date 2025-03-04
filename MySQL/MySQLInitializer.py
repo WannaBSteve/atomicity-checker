@@ -1,229 +1,291 @@
 import random
 import mysql.connector
+from typing import List, Dict, Tuple, Optional
+from enum import Enum
+
+class MySQLDataType(Enum):
+    TINYINT = "TINYINT"
+    SMALLINT = "SMALLINT"
+    MEDIUMINT = "MEDIUMINT"
+    INT = "INT"
+    BIGINT = "BIGINT"
+    
+    FLOAT = "FLOAT"
+    DOUBLE = "DOUBLE"
+    DECIMAL = "DECIMAL"
+    
+    BINARY = "BINARY"
+    VARBINARY = "VARBINARY"
+    
+    CHAR = "CHAR"
+    VARCHAR = "VARCHAR"
+    TINYTEXT = "TINYTEXT"
+    TEXT = "TEXT"
+    MEDIUMTEXT = "MEDIUMTEXT"
+    LONGTEXT = "LONGTEXT"
+    
+    BLOB = "BLOB"
+    MEDIUMBLOB = "MEDIUMBLOB"
+    LONGBLOB = "LONGBLOB"
+    
+    DATE = "DATE"
+    TIME = "TIME"
+    DATETIME = "DATETIME"
+    TIMESTAMP = "TIMESTAMP"
+    
+    JSON = "JSON"
+    ENUM = "ENUM"
+    SET = "SET"
+
+    @staticmethod
+    def get_random_data_type():
+        return random.choice([
+            MySQLDataType.INT,
+            MySQLDataType.FLOAT,
+            MySQLDataType.DOUBLE,
+            MySQLDataType.CHAR,
+            MySQLDataType.VARCHAR,
+            MySQLDataType.TEXT
+        ])
+
+    @staticmethod
+    def is_numeric(data_type: str) -> bool:
+        numeric_types = [
+            MySQLDataType.TINYINT,
+            MySQLDataType.SMALLINT,
+            MySQLDataType.MEDIUMINT,
+            MySQLDataType.INT,
+            MySQLDataType.BIGINT,
+            MySQLDataType.FLOAT,
+            MySQLDataType.DOUBLE,
+            MySQLDataType.DECIMAL
+        ]
+        return any(dt.value in data_type for dt in numeric_types)
+
+    @staticmethod
+    def is_string(data_type: str) -> bool:
+        string_types = [
+            MySQLDataType.CHAR,
+            MySQLDataType.VARCHAR,
+            MySQLDataType.TINYTEXT,
+            MySQLDataType.TEXT,
+            MySQLDataType.MEDIUMTEXT,
+            MySQLDataType.LONGTEXT
+        ]
+        return any(dt.value in data_type for dt in string_types)
+
+    @staticmethod
+    def has_len(data_type: str) -> bool:
+        return any(dt.value in data_type for dt in [MySQLDataType.CHAR, MySQLDataType.VARCHAR])
+
+class MySQLColumn:
+    def __init__(self, table_name: str, column_name: str, data_type: str, 
+                 is_primary: bool, is_unique: bool, is_not_null: bool, size: int = 0):
+        self.table_name = table_name
+        self.column_name = column_name
+        self.data_type = data_type
+        self.is_primary = is_primary
+        self.is_unique = is_unique
+        self.is_not_null = is_not_null
+        self.size = size
+        self.appeared_values = []  # 对应 Java 中的 appearedValues
+
+    def get_random_value(self) -> str:
+        if self.is_primary:
+            return "NULL"  # 自增主键
+
+        # 完全对齐 Java 实现的数据类型判断
+        data_type_upper = self.data_type.upper()
+        
+        if "TINYINT" in data_type_upper:
+            return str(random.randint(-128, 127))
+        elif "SMALLINT" in data_type_upper:
+            return str(random.randint(-32768, 32767))
+        elif "MEDIUMINT" in data_type_upper:
+            return str(random.randint(-8388608, 8388607))
+        elif "INT" in data_type_upper or "BIGINT" in data_type_upper:
+            return str(random.randint(-2147483648, 2147483647))
+        elif "FLOAT" in data_type_upper or "DOUBLE" in data_type_upper or "DECIMAL" in data_type_upper:
+            return str(round(random.uniform(-100, 100), 2))
+        elif any(t in data_type_upper for t in ["CHAR", "VARCHAR", "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT"]):
+            if self.size == 0:
+                self.size = 20
+            random_str = ''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(random.randint(1, self.size)))
+            return f'"{random_str}"'
+        elif any(t in data_type_upper for t in ["BLOB", "MEDIUMBLOB", "LONGBLOB"]):
+            return self._random_hex_str()
+        else:
+            raise ValueError(f"Unexpected data type: {self.data_type}")
+
+    def _random_hex_str(self) -> str:
+        """对应 Java 中的 randomHexStr 方法"""
+        size = 8
+        hex_chars = "0123456789ABCDEF"
+        hex_str = ''.join(random.choice(hex_chars) for _ in range(size))
+        return f"0x{hex_str}"
 
 class MySQLInitializer:
     def __init__(self, connection, database):
         self.conn = connection
         self.database = database
         self.cursor = self.conn.cursor()
+        self.columns: List[MySQLColumn] = []
+        self.table_columns: Dict[str, List[Tuple[str, str]]] = {}  # 存储表的列信息
         
-        # 动态控制初始化的表数量和操作次数
-        self.min_tables = 1
-        self.max_tables = 1
-        self.max_inserts_per_table = 15
-        self.max_actions_per_table = 5
-
-        self.used_ids = set()  # 添加这一行来跟踪已使用的ID
-
     def initialize_database(self):
-        """初始化数据库，删除旧数据库并创建新数据库"""
+        """初始化数据库"""
         self.cursor.execute(f"DROP DATABASE IF EXISTS {self.database}")
         self.cursor.execute(f"CREATE DATABASE {self.database}")
         self.cursor.execute(f"USE {self.database}")
-
-    def generate_tables(self):
-        """生成随机数量的表"""
-        # num_tables = random.randint(self.min_tables, self.max_tables)
-        num_tables = 1
-        for i in range(num_tables):
-            table_name = f"table_{i}"
-            create_table_sql = self._generate_create_table_sql(table_name)
-            print(f"Creating Table: {create_table_sql}")
-            self.cursor.execute(create_table_sql)
-
-    def _generate_create_table_sql(self, table_name):
-        """生成随机建表SQL"""
-        num_columns = random.randint(2, 10)  # 每个表随机列数
-        # 确保id列为主键和AUTO_INCREMENT
-        column_definitions = ["id INT AUTO_INCREMENT", "col_gap INT DEFAULT NULL"]
-        key_definitions = ["PRIMARY KEY (`id`)", "KEY `gap` (`col_gap`)"]
-        column_types = ["INT", "VARCHAR(255)", "FLOAT", "DOUBLE", "TEXT"]
-        
-        # 存储所有可以作为键的列名（不包括TEXT类型的列）
-        key_candidate_columns = []
-        
-        # 生成普通列
-        for i in range(num_columns):
-            column_name = f"col_{i}"
-            column_type = random.choice(column_types)
-            column_definitions.append(f"{column_name} {column_type}")
-            # TEXT类型不适合作为键，所以只收集非TEXT类型的列
-            if column_type != "TEXT":
-                key_candidate_columns.append(column_name)
-        
-        # 随机决定要创建多少个额外的索引（0到3个）
-        if key_candidate_columns:  # 确保有可用的列来创建索引
-            num_extra_keys = random.randint(0, min(3, len(key_candidate_columns)))
-            for _ in range(num_extra_keys):
-                if key_candidate_columns:  # 确保还有可用的列
-                    # 随机选择单列索引或复合索引
-                    if random.choice([True, False]):  # 50% 的概率生成复合索引
-                        # 随机选择 2 到 min(4, len(key_candidate_columns)) 列
-                        num_columns_in_index = random.randint(2, min(4, len(key_candidate_columns)))
-                        selected_columns = random.sample(key_candidate_columns, num_columns_in_index)
-                        index_type = random.choice(["INDEX", "UNIQUE INDEX"])  # 随机选择索引类型
-                        key_name = f"{index_type.lower().replace(' ', '_')}_" + "_".join(selected_columns)
-                        columns_in_index = ", ".join([f"`{col}`" for col in selected_columns])
-                        key_definitions.append(f"{index_type} `{key_name}` ({columns_in_index})")
-                        # 从候选列中移除已使用的列，避免重复
-                        key_candidate_columns = [col for col in key_candidate_columns if col not in selected_columns]
-                    else:
-                        # 单列索引
-                        key_column = random.choice(key_candidate_columns)
-                        key_candidate_columns.remove(key_column)  # 避免重复使用同一列
-                        index_type = random.choice(["INDEX", "UNIQUE INDEX"])  # 随机选择索引类型
-                        key_name = f"{index_type.lower().replace(' ', '_')}_{key_column}"
-                        key_definitions.append(f"{index_type} `{key_name}` (`{key_column}`)")
-        
-        columns_sql = ", ".join(column_definitions)
-        key_sql = ", ".join(key_definitions)
-        sql = columns_sql + "," + key_sql
-        return f"CREATE TABLE {table_name} ({sql})"
-
-
-    def populate_tables(self):
-        """随机向每个表插入数据"""
-
-        tables = ["table_0"]
-        for table in tables:
-            num_inserts = random.randint(5, self.max_inserts_per_table)
-            for _ in range(num_inserts):
-                insert_sql = self._generate_insert_sql(table)
-                print(f"Inserting Data: {insert_sql}")
-                self.cursor.execute(insert_sql)
     
-    def _generate_insert_sql(self, table_name):
-        """生成随机插入语句，确保数据类型与列定义匹配"""
-        self.cursor.execute(f"DESCRIBE {table_name}")
-        columns = [(row[0], row[1]) for row in self.cursor.fetchall()]  # 获取列名和数据类型
-
-        # 不要生成所有列的值，而是跳过id列
-        column_names = [col[0] for col in columns]  
-        values = [self._generate_value_by_type(col[1]) for col in columns]  # 跳过id列
-        # values最前面id列值为null
-        values[0] = "NULL"
-        # 构建INSERT语句时明确指定列名（除了id列）
-        columns_sql = ", ".join(column_names)
-        values_sql = ", ".join(values)
-        return f"INSERT INTO {table_name} ({columns_sql}) VALUES ({values_sql})"
-
-    def _generate_value_by_type(self, col_type):
-        """根据列的类型生成随机值"""
-        if "int" in col_type.lower():
-            if "auto_increment" in col_type.lower():
-                # 为auto_increment列生成NULL，让MySQL自动处理
-                return "NULL"
-            return str(random.randint(1, 100))
-        elif "varchar" in col_type.lower() or "text" in col_type.lower():
-            return f"'{self._generate_random_string()}'"
-        elif "float" in col_type.lower() or "double" in col_type.lower():
-            return str(round(random.uniform(1, 100), 2))
-        else:
-            raise ValueError(f"Unsupported column type: {col_type}")
-
-
-    def _generate_random_string(self, length=5):
-        """生成随机字符串"""
-        letters = "abcdefghijklmnopqrstuvwxyz"
-        return "".join(random.choice(letters) for _ in range(length))
-
-    def execute_random_actions(self):
-        """执行一系列随机化操作"""
-        self.cursor.execute("SHOW TABLES")
-        tables = [row[0] for row in self.cursor.fetchall()]
-        actions = [
-            self._generate_update_sql,
-            self._generate_delete_sql,
-            self._generate_alter_table_sql
-        ]
-
-        for table in tables:
-            num_actions = random.randint(0, self.max_actions_per_table)
-            for _ in range(num_actions):
-                action = random.choice(actions)
-                sql = action(table)
-                if sql:
-                    print(f"Executing: {sql}")
-                    self.cursor.execute(sql)
-
-    def _generate_update_sql(self, table_name):
-        """生成随机更新语句，确保值与列类型匹配"""
-        self.cursor.execute(f"DESCRIBE {table_name}")
-        columns = [(row[0], row[1]) for row in self.cursor.fetchall()]  # 获取列名和类型
-        if not columns:
-            return None
-
-        # 随机选择一个列
-        column, col_type = random.choice(columns)
-        value = self._generate_value_by_type(col_type)
-
-        # 随机选择条件列
-        condition_column, condition_col_type = random.choice(columns)
-        condition_value = self._generate_value_by_type(condition_col_type)
+    def generate_tables_with_data_and_index(self):
+        """生成表结构、数据和索引"""
+        table_name = "table_0"  # 固定生成一个表
         
-        return f"UPDATE {table_name} SET {column} = {value} WHERE {condition_column} = {condition_value}"
-
-    def _generate_delete_sql(self, table_name):
-        """生成随机删除语句，确保条件值与列类型匹配"""
-        self.cursor.execute(f"DESCRIBE {table_name}")
-        columns = [(row[0], row[1]) for row in self.cursor.fetchall()]  # 获取列名和类型
-        if not columns:
-            return None
-
-        # 随机选择条件列
-        condition_column, condition_col_type = random.choice(columns)
-        condition_value = self._generate_value_by_type(condition_col_type)
-
-        return f"DELETE FROM {table_name} WHERE {condition_column} = {condition_value}"
-
-
-    def _generate_alter_table_sql(self, table_name):
-        """生成随机表结构修改语句"""
-        alter_action = random.choice(["ADD", "DROP", "MODIFY"])
+        # 生成列定义
+        columns = self._generate_columns()
+        create_table_sql = self._generate_create_table_sql(table_name, columns)
+        print(f"Creating table: {create_table_sql}")
+        self.cursor.execute(create_table_sql)
         
-        if alter_action == "ADD":
-            new_column = f"col_{random.randint(100, 999)}"
-            new_type = random.choice(["INT", "VARCHAR(255)", "FLOAT"])
-            return f"ALTER TABLE {table_name} ADD COLUMN {new_column} {new_type}"
-        elif alter_action == "DROP":
-            self.cursor.execute(f"DESCRIBE {table_name}")
-            columns = [row[0] for row in self.cursor.fetchall()]
-            # 移除不能删除的关键列
-            protected_columns = ['id', 'col_gap']  # 添加 col_gap 到保护列表
-            columns = [col for col in columns if col not in protected_columns]
-            if not columns:
-                return None
-            column_to_drop = random.choice(columns)
-            return f"ALTER TABLE {table_name} DROP COLUMN {column_to_drop}"
-        elif alter_action == "MODIFY":
-            self.cursor.execute(f"DESCRIBE {table_name}")
-            columns = [(row[0], row[1]) for row in self.cursor.fetchall()]
-            # 移除id列，确保不会被修改
-            columns = [(col, type_) for col, type_ in columns if col != 'id']
-            if not columns:
-                return None
+        # 保存列信息
+        self.table_columns[table_name] = columns
+        
+        # 插入数据
+        self._populate_table(table_name)
+        
+        # 创建索引
+        self._create_indexes(table_name)
+        
+    def _generate_columns(self) -> List[Tuple[str, str, bool, bool, bool, int]]:
+        """生成列定义"""
+        columns = []
+        # 添加id列作为主键
+        columns.append(("id", "INT", True, False, True, 0))
+        self.columns.append(MySQLColumn("table_0", "id", "INT", True, False, True, 0))
+        
+        # 生成2-9个随机列
+        num_columns = random.randint(2, 9)
+        for i in range(num_columns):
+            col_name = f"c{i}"
+            data_type = MySQLDataType.get_random_data_type().value
             
-            column_to_modify, current_type = random.choice(columns)
+            # 确定列的约束
+            is_primary = False
+            is_unique = random.choice([True, False]) if MySQLDataType.is_numeric(data_type) else False
+            is_not_null = random.choice([True, False])
             
-            # 定义类型兼容性映射
-            compatible_types = {
-                'text': ['TEXT', 'VARCHAR(255)'],
-                'varchar': ['TEXT', 'VARCHAR(255)'],
-                'int': ['INT', 'BIGINT'],
-                'float': ['FLOAT', 'DOUBLE'],
-                'double': ['FLOAT', 'DOUBLE']
+            size = 0
+            if MySQLDataType.has_len(data_type):
+                size = random.randint(1, 20)
+                data_type = f"{data_type}({size})"
+            
+            # 创建并存储列对象
+            column = MySQLColumn("table_0", col_name, data_type, is_primary, is_unique, is_not_null, size)
+            self.columns.append(column)
+            columns.append((col_name, data_type, is_primary, is_unique, is_not_null, size))
+            
+        return columns
+
+    def _generate_create_table_sql(self, table_name: str, columns: List[Tuple[str, str, bool, bool, bool, int]]) -> str:
+        """生成建表SQL"""
+        column_defs = []
+        for col_name, data_type, is_primary, is_unique, is_not_null, size in columns:
+            col_def = f"{col_name} {data_type}"
+            if is_primary:
+                col_def += " PRIMARY KEY AUTO_INCREMENT"
+            if is_unique and not is_primary:
+                col_def += " UNIQUE"
+            if is_not_null and not is_primary:
+                col_def += " NOT NULL"
+            column_defs.append(col_def)
+            
+        # 添加表选项
+        table_options = self._generate_table_options()
+        
+        return f"CREATE TABLE {table_name} ({', '.join(column_defs)}) {table_options}"
+    
+    def _generate_table_options(self) -> str:
+        """生成表选项"""
+        options = []
+        if random.random() < 0.3:  # 30%概率添加选项
+            possible_options = {
+                "AUTO_INCREMENT": lambda: random.randint(1, 1000),
+                "CHECKSUM": lambda: 1,
+                "DELAY_KEY_WRITE": lambda: random.choice([0, 1]),
+                "MAX_ROWS": lambda: random.randint(1000, 1000000),
+                "MIN_ROWS": lambda: random.randint(1, 100),
+                "PACK_KEYS": lambda: random.choice(["1", "0", "DEFAULT"]),
+                "STATS_AUTO_RECALC": lambda: random.choice(["1", "0", "DEFAULT"]),
+                "COMMENT": lambda: "'comment info'"
             }
             
-            # 根据当前类型选择兼容的新类型
-            current_base_type = current_type.lower().split('(')[0]  # 提取基本类型
-            if current_base_type in compatible_types:
-                new_type = random.choice(compatible_types[current_base_type])
-                return f"ALTER TABLE {table_name} MODIFY COLUMN {column_to_modify} {new_type}"
+            # 随机选择1-3个选项
+            num_options = random.randint(1, 3)
+            selected_options = random.sample(list(possible_options.items()), num_options)
             
-            return None  # 如果找不到兼容的类型，返回None
+            for option_name, value_generator in selected_options:
+                options.append(f"{option_name}={value_generator()}")
+                
+        if options:
+            return "ENGINE=InnoDB " + " ".join(options)
+        return "ENGINE=InnoDB"
 
+    def _populate_table(self, table_name: str):
+        """填充表数据"""
+        num_rows = random.randint(5, 15)
+        for _ in range(num_rows):
+            values = []
+            for column in self.columns:
+                values.append(column.get_random_value())
+            
+            col_names = [col.column_name for col in self.columns]
+            insert_sql = f"INSERT INTO {table_name} ({', '.join(col_names)}) VALUES ({', '.join(values)})"
+            
+            print(f"Inserting data: {insert_sql}")
+            self.cursor.execute(insert_sql)
+    
+    def _create_indexes(self, table_name: str):
+        """创建索引，对齐Java实现"""
+        # 筛选可作为索引的列（非TEXT类型的列）
+        indexable_columns = [col for col in self.columns 
+                           if not any(t in col.data_type.upper() 
+                                    for t in ["TEXT", "BLOB"])]
+        
+        if not indexable_columns:
+            return
+            
+        # 随机创建1-3个索引
+        num_indexes = random.randint(1, 3)
+        for i in range(num_indexes):
+            # 随机决定是否创建复合索引
+            is_composite = random.choice([True, False])
+            num_columns = random.randint(2, 3) if is_composite else 1
+            
+            # 随机选择列，但确保不重复选择相同的列组合
+            selected_columns = random.sample(indexable_columns, 
+                                          min(num_columns, len(indexable_columns)))
+            
+            # 随机决定是否为唯一索引
+            is_unique = random.choice([True, False])
+            
+            index_name = f"idx_{i}"
+            index_type = "UNIQUE INDEX" if is_unique else "INDEX"
+            
+            # 使用列名创建索引
+            column_names = [col.column_name for col in selected_columns]
+            index_sql = (f"CREATE {index_type} {index_name} ON {table_name} "
+                        f"({', '.join(column_names)})")
+            
+            try:
+                print(f"Creating index: {index_sql}")
+                self.cursor.execute(index_sql)
+            except Exception as e:
+                print(f"Error creating index: {e}")
+                # 继续创建其他索引
+    
     def commit_and_close(self):
-        """只提交更改,不关闭连接(由调用者管理)"""
+        """提交更改并关闭游标"""
         try:
             self.conn.commit()
         except Exception as e:
