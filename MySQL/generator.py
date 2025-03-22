@@ -1,16 +1,10 @@
 import random
 import threading
 import mysql.connector
-from MySQLTable import MySQLTableGenerator
 from MySQLInitializer import MySQLInitializer
-from MySQLParameter import SQLParamGenerator
-from MySQLTemplateGen import MySQLTemplateGen
-from MySQLASTGen import MySQLASTGen
-from Transaction import Transaction
-from statement_cell import StatementCell
 from transaction_generator import TransactionGenerator
 from datetime import datetime
-
+import argparse
 import logging
 import re
 import os
@@ -221,30 +215,6 @@ def get_iso_template(isolation_level: str):
     """获取隔离级别和锁层次的模板"""
     return iso_lock_template[isolation_level]
 
-class DatabaseConnection:
-    """数据库连接管理类"""
-    def __init__(self, host: str, user: str, password: str, database: str, port: int):
-        self.config = {
-            "host": host,
-            "user": user,
-            "password": password,
-            "database": database,
-            "port": port
-        }
-    def create_connection(self):
-       try:
-           return mysql.connector.connect(**self.config)
-       except mysql.connector.Error as err:
-           logger.error(f"数据库连接失败: {err}")
-           raise
-    def get_result(self, sql: str) -> List[Tuple]:
-       conn = self.create_connection()
-       try:
-           with conn.cursor() as cursor:
-               cursor.execute(sql)
-               return cursor.fetchall()
-       finally:
-           conn.close()
 
 class AtomicityChecker:
     """
@@ -256,7 +226,7 @@ class AtomicityChecker:
     
 
     简化test oracle：
-    2. 如果存在一个模拟并发的执行序列serial，某些事务最终被提交（Commit）、某些被回滚（Rollback），则：
+    2. 如果存在一个模拟出的真实并发执行序列serial，某些事务最终被提交（Commit）、某些被回滚（Rollback），则：
     serial执行后的数据库状态，应等同于serial剔除被回滚的事务后的状态。
     """
     def __init__(self, host: str, user: str, password: str, database: str, port: int, isolation_level: str,
@@ -284,7 +254,18 @@ class AtomicityChecker:
             "buffered": True,
             "autocommit": False
         }
-        self.table_name = "table_0"
+        self.slave_db_config = {
+            "host": host,
+            "user": user,
+            "password": password,
+            "database": database,
+            "port": port+2,
+            "connect_timeout": 60,
+            "use_pure": True,
+            "buffered": True,
+            "autocommit": False
+        }
+
         self.trx_sqls = trx_sqls
         self.num_transactions = len(trx_sqls)
         self.serial = serial
@@ -560,8 +541,8 @@ class AtomicityChecker:
                                 blocked_stmts_copy = blocked_stmts.copy()
                                 for s_idx, (trx_id1, stmt1) in blocked_stmts_copy.items():
                                     if trx_id1 in rollback_trx_ids and trx_id1 in blocked_trx_ids:
-                                        blocked_trx_ids.remove(trx_id1)
                                         del blocked_stmts[s_idx]
+                                blocked_trx_ids.remove(trx_id1)
 
                                 if not cleaned:
                                     self.rollback_trx_ids = rollback_trx_ids
@@ -733,7 +714,7 @@ class AtomicityChecker:
             logger.info(f"trx_sqls: {trx_sqls}")
 
             try:
-                conn = self._create_connection()
+                conn = self._create_slave_connection()
                 self.snapshot_before = self._take_snapshot(conn)
                 conn.close()
                 
@@ -750,7 +731,7 @@ class AtomicityChecker:
                 return True, None, serial, [], []
 
             # 保存并发执行后的数据库状态
-            conn = self._create_connection()
+            conn = self._create_slave_connection()
             self.snapshot_serial = self._take_snapshot(conn)
             conn.close()
 
@@ -797,7 +778,7 @@ class AtomicityChecker:
                 logger.error(error_msg)
                 
             # 获取清理后序列的执行状态
-            conn = self._create_connection()
+            conn = self._create_slave_connection()
             self.snapshot_cleaned = self._take_snapshot(conn)
             conn.close()
             
@@ -821,7 +802,16 @@ class AtomicityChecker:
         try:
             return mysql.connector.connect(**self.db_config)
         except mysql.connector.Error as err:
-            logger.error(f"数据库连接失败: {err}")
+            logger.error(f"主节点数据库连接失败: {err}")
+            logger.error("")
+            raise
+    
+    def _create_slave_connection(self):
+        """创建数据库连接"""
+        try:
+            return mysql.connector.connect(**self.slave_db_config)
+        except mysql.connector.Error as err:
+            logger.error(f"从节点数据库连接失败: {err}")
             logger.error("")
             raise
 
@@ -1042,6 +1032,8 @@ class AtomicityChecker:
             SET1 = set()
             SET2 = set()
             for table_name in snapshot1.keys():
+                SET1.clear()
+                SET2.clear()
                 if len(snapshot1[table_name]) != len(snapshot2[table_name]):
                     return False
                 
@@ -1052,11 +1044,9 @@ class AtomicityChecker:
                 for row1, row2 in zip(rows1, rows2):
                     SET1.add(row1[1:])
                     SET2.add(row2[1:])
-                # if rows1 != rows2:
-                #     return False
 
-            if SET1 != SET2:
-                return False
+                if SET1 != SET2:
+                    return False
 
             return True
         except Exception as e:
@@ -1064,13 +1054,27 @@ class AtomicityChecker:
             return False
 
 
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='MySQL Atomicity Checker')
+    parser.add_argument('--db', type=str, choices=["mysql", "mysql-cluster", "tidb"], default="mysql",
+                        help='数据库类型')
+    parser.add_argument('--port', type=int, default=4005,
+                        help='数据库端口')
+    return parser.parse_args()
+
+# 设置全局锁等待超时
+args = parse_arguments()
+db = args.db
+port = args.port
+isolation_level = random.choice(["SER", "RR", "RC", "RU"])
 # 修改连接池配置
+
 dbconfig = {
     "host": "localhost",
     "user": "root", 
     "password": "123456",
     "database": "test",
-    "port": 3308,
+    "port": port,
     "connection_timeout": 60,
     "use_pure": True,            # 使用纯Python实现
     "buffered": True,            # 使用buffered模式
@@ -1079,20 +1083,18 @@ dbconfig = {
     "consume_results": True,     # 自动消费结果
     "autocommit": False,         # 显式控制事务
 }
+conn = mysql.connector.connect(**dbconfig)
+cursor = conn.cursor()
+cursor.execute("SET GLOBAL innodb_lock_wait_timeout=50")
+cursor.execute("SET GLOBAL net_write_timeout = 600000")
+cursor.execute("SET GLOBAL net_read_timeout = 600000")
+# 设置隔离级别
+cursor.execute(f"set global transaction isolation level {ISOLATION_LEVELS[isolation_level]}")
+cursor.close()
+conn.close()
 
-# 设置全局锁等待超时
-try:
-    conn = mysql.connector.connect(**dbconfig)
-    cursor = conn.cursor()
-    cursor.execute("SET GLOBAL innodb_lock_wait_timeout=50")
-    cursor.execute("SET GLOBAL net_write_timeout = 600000")
-    cursor.execute("SET GLOBAL net_read_timeout = 600000")
-    # 设置隔离级别
-    cursor.execute("set global transaction isolation level REPEATABLE READ")
-    cursor.close()
-    conn.close()
-except mysql.connector.Error as err:
-    logger.warning(f"设置锁等待超时失败: {err}")
+
+
 
 # 进行实验
 num_of_runs = 1000
@@ -1101,76 +1103,97 @@ logger.debug("DEBUG TEST")
 logger.error("ERROR TEST")
 bug_count = 1
 
-isolation_level = "RR"
+
 date_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 SAVE_DIR = f"{database_save_dir}/{isolation_level}/{date_time}"
 for i in range(num_of_runs):
+    args = parse_arguments()
     # 添加日志记录
     print(f"iter: {i}") 
     logger.info(f"iter: {i}")
+    logger.info("----------SETTINGS-----------")
+    logger.info(f"Isolation level: {isolation_level}")
+    logger.info("-----------------------------")
     conn = None
     try:
-        # 创建数据库连接
-        conn = mysql.connector.connect(**dbconfig)
+        # 先不指定数据库连接
+        dbconfig_no_db = dbconfig.copy()
+        dbconfig_no_db.pop("database")
+        conn = mysql.connector.connect(**dbconfig_no_db)
         
-        # 使用同一个连接初始化
-        initializer = MySQLInitializer(
-            connection=conn,
-            database="test"
-        )
+        # # 创建test数据库
+        # cursor = conn.cursor()
+        # cursor.execute("CREATE DATABASE IF NOT EXISTS test")
+        # cursor.close()
         
+        # # 重新连接到test数据库
+        # conn.close()
+        # conn = mysql.connector.connect(**dbconfig)
+        try:
+            initializer = MySQLInitializer(
+                connection=conn,
+                database="test"
+            )
+        except Exception as e:
+            print(f"初始化Initializer失败: {e}")
+            print("")
+            logger.error(f"初始化Initializer失败: {e}")
+            logger.error("")
+            raise
+        
+        # num_of_tables = random.randint(1, 3)
+        num_of_tables = 1
         # 初始化数据库
-        initializer.initialize_database()
-        initializer.generate_tables_with_data_and_index()
-        initializer.commit_and_close()
-
-        # 获取表的元数据
-        cursor = conn.cursor()
-        cursor.execute("DESCRIBE table_0")
-        res = cursor.fetchall()
-        print(f"Table metadata: {res}")
-        logger.info(f"res: {res}")
+        try:
+            initializer.initialize_database()
+            initializer.generate_tables_with_data_and_index(num_of_tables)
+            initializer.commit_and_close()
+        except Exception as e:
+            print(f"初始化数据库失败: {e}")
+            print("")
+            logger.error(f"初始化数据库失败: {e}")
+            logger.error("")
+            raise
         
         # 构建列信息字典，格式需要与 TransactionGenerator 期望的格式匹配
-        columns = {}
-        for row in res:
-            col_name = row[0]  # Field
-            data_type = row[1]  # Type
-            is_nullable = row[2]  # Null
-            key = row[3]  # Key
-            
-            # 解析数据类型和大小
-            size = 0
-            base_type = data_type
-            if "(" in data_type:
-                base_type = data_type.split("(")[0]
-                size = int(data_type.split("(")[1].rstrip(")"))
-            
-            is_primary = key == "PRI"
-            is_unique = key in ["UNI", "PRI"]  # 主键也是唯一的
-            is_not_null = is_nullable == "NO"
-            
-            # 按照 TransactionGenerator 期望的格式存储列信息
-            # (col_name, data_type, is_primary, is_unique, not is_nullable)
-            columns[col_name] = (col_name, base_type, is_primary, is_unique, is_not_null)
+        tables = initializer.tables
+        columns = initializer.columns
         
         # 提交初始化更改
         conn.commit()
         cursor.close()
 
-        # 使用 TransactionGenerator 生成事务
-        tx_generator = TransactionGenerator("table_0", columns, isolation_level)
-        num_transactions = random.randint(2, 5)
-
+        try:
+            # 使用 TransactionGenerator 生成事务
+            tx_generator = TransactionGenerator(tables, columns, isolation_level)
+            num_transactions = random.randint(1, 4)
+        except Exception as e:
+            print(f"初始化事务生成器失败: {e}")
+            print("")
+            logger.error(f"初始化事务生成器失败: {e}")
+            logger.error("")
+            raise
+        
         trx_sqls = {}
         serial = []
         rollback_trx_num = 0
-        for tx_id in range(1, num_transactions + 1):
-            statements = tx_generator.gen_transaction(tx_id)
-            trx_sqls[tx_id] = statements
-            if "ROLLBACK" in statements:
-                rollback_trx_num += 1
-        # 至少有一个事务是rollback，没有就随机选择若干个
+        try:
+            for tx_id in range(1, num_transactions + 1):
+                statements = tx_generator.gen_transaction(tx_id)
+                trx_sqls[tx_id] = statements
+                for statement in statements:
+                    if "ROLLBACK" in statement:
+                        rollback_trx_num += 1
+                        break
+
+        except Exception as e:
+            print(f"生成事务语句失败: {e}")
+            print("")
+            logger.error(f"生成事务语句失败: {e}")
+            logger.error("")
+            raise
+
+        # 至少有一个事务是包含条件回滚rollback，没有就随机选择若干个事务
         if rollback_trx_num == 0:
             rollback_trx_num = random.randint(1, num_transactions)
 
@@ -1209,7 +1232,7 @@ for i in range(num_of_runs):
             
         # 创建原子性检查器
         atomicity_checker = AtomicityChecker(
-            "localhost", "root", "123456", "test", 3308, isolation_level,
+            "localhost", "root", "123456", "test", port, isolation_level,
             trx_sqls, serial
         )
         
@@ -1240,7 +1263,7 @@ for i in range(num_of_runs):
             # 导出数据库状态
             atomicity_checker._restore_initial_state()
             
-            dump_cmd = f"mysqldump -h localhost -P 3308 -u root -p123456 test > {bug_case_dir}/initial_state.sql"
+            dump_cmd = f"mysqldump -h localhost -P 4000 -u root -p123456 test > {bug_case_dir}/initial_state.sql"
             os.system(dump_cmd)
 
             # 保存事务和序列信息

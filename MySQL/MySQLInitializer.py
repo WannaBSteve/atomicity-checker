@@ -129,41 +129,45 @@ class MySQLInitializer:
         self.conn = connection
         self.database = database
         self.cursor = self.conn.cursor()
-        self.columns: List[MySQLColumn] = []
-        self.table_columns: Dict[str, List[Tuple[str, str]]] = {}  # 存储表的列信息
-        
+        self.tables: Dict[str, List[Tuple[str, str, bool, bool, bool, int]]] = {}  # 存储表的列信息
+        self.columns: Dict[str, List[MySQLColumn]] = {}  # 存储表的列信息
+        self.num_of_tables = 0
+
     def initialize_database(self):
         """初始化数据库"""
         self.cursor.execute(f"DROP DATABASE IF EXISTS {self.database}")
-        self.cursor.execute(f"CREATE DATABASE {self.database}")
+        self.cursor.execute(f"CREATE DATABASE IF NOT EXISTS {self.database}")
         self.cursor.execute(f"USE {self.database}")
     
-    def generate_tables_with_data_and_index(self):
+    def generate_tables_with_data_and_index(self, num_of_tables: int):
         """生成表结构、数据和索引"""
-        table_name = "table_0"  # 固定生成一个表
+        # table_name = "table_0"  # 固定生成一个表
+        # 多表
+        self.num_of_tables = num_of_tables
+        table_names = [f"table_{i}" for i in range(num_of_tables)]
+        self.tables = {table_name: [] for table_name in table_names}
+        self.columns = {table_name: [] for table_name in table_names}
+        for table_name in table_names:
+            # 生成列定义
+            columns = self._generate_columns(table_name)
+            create_table_sql = self._generate_create_table_sql(table_name, columns)
+            print(f"Creating table: {create_table_sql}")
+            self.cursor.execute(create_table_sql)
+            self.tables[table_name] = columns
+
+            # 插入数据
+            self._populate_table(table_name)
+            
+            # 创建索引
+            self._create_indexes(table_name)
         
-        # 生成列定义
-        columns = self._generate_columns()
-        create_table_sql = self._generate_create_table_sql(table_name, columns)
-        print(f"Creating table: {create_table_sql}")
-        self.cursor.execute(create_table_sql)
-        
-        # 保存列信息
-        self.table_columns[table_name] = columns
-        
-        # 插入数据
-        self._populate_table(table_name)
-        
-        # 创建索引
-        self._create_indexes(table_name)
-        
-    def _generate_columns(self) -> List[Tuple[str, str, bool, bool, bool, int]]:
+    def _generate_columns(self, table_name: str) -> List[Tuple[str, str, bool, bool, bool, int]]:
         """生成列定义"""
         columns = []
         # 添加id列作为主键
         columns.append(("id", "INT", True, False, True, 0))
-        self.columns.append(MySQLColumn("table_0", "id", "INT", True, False, True, 0))
-        
+        self.columns[table_name].append(MySQLColumn(table_name, "id", "INT", True, False, True, 0))
+
         # 生成2-9个随机列
         num_columns = random.randint(2, 9)
         for i in range(num_columns):
@@ -181,10 +185,9 @@ class MySQLInitializer:
                 data_type = f"{data_type}({size})"
             
             # 创建并存储列对象
-            column = MySQLColumn("table_0", col_name, data_type, is_primary, is_unique, is_not_null, size)
-            self.columns.append(column)
             columns.append((col_name, data_type, is_primary, is_unique, is_not_null, size))
-            
+            self.columns[table_name].append(MySQLColumn(table_name, col_name, data_type, is_primary, is_unique, is_not_null, size))
+
         return columns
 
     def _generate_create_table_sql(self, table_name: str, columns: List[Tuple[str, str, bool, bool, bool, int]]) -> str:
@@ -220,12 +223,14 @@ class MySQLInitializer:
                 "COMMENT": lambda: "'comment info'"
             }
             
-            # 随机选择1-3个选项
-            num_options = random.randint(1, 3)
-            selected_options = random.sample(list(possible_options.items()), num_options)
+            # 修改选择选项的方式
+            option_keys = list(possible_options.keys())
+            num_options = random.randint(1, min(3, len(option_keys)))
+            selected_keys = random.sample(option_keys, num_options)
             
-            for option_name, value_generator in selected_options:
-                options.append(f"{option_name}={value_generator()}")
+            for key in selected_keys:
+                value = possible_options[key]()
+                options.append(f"{key}={value}")
                 
         if options:
             return "ENGINE=InnoDB " + " ".join(options)
@@ -234,12 +239,13 @@ class MySQLInitializer:
     def _populate_table(self, table_name: str):
         """填充表数据"""
         num_rows = random.randint(5, 15)
+        columns = self.columns[table_name]
         for _ in range(num_rows):
             values = []
-            for column in self.columns:
+            for column in columns:
                 values.append(column.get_random_value())
             
-            col_names = [col.column_name for col in self.columns]
+            col_names = [col.column_name for col in columns]
             insert_sql = f"INSERT INTO {table_name} ({', '.join(col_names)}) VALUES ({', '.join(values)})"
             
             print(f"Inserting data: {insert_sql}")
@@ -248,7 +254,8 @@ class MySQLInitializer:
     def _create_indexes(self, table_name: str):
         """创建索引，对齐Java实现"""
         # 筛选可作为索引的列（非TEXT类型的列）
-        indexable_columns = [col for col in self.columns 
+        columns = self.columns[table_name]
+        indexable_columns = [col for col in columns
                            if not any(t in col.data_type.upper() 
                                     for t in ["TEXT", "BLOB"])]
         
