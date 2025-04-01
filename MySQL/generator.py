@@ -273,6 +273,9 @@ class AtomicityChecker:
         self.snapshot_before = None
         self.snapshot_serial = None
         self.snapshot_cleaned = None
+        # self.sp_snapshot = {}
+        self.rollback_snapshot = {}
+        self.sub_checkpoint_pair = []
         self.executed_serial = []
         self.cleaned_executed_serial = []
         self.rollback_trx_ids = set()
@@ -285,6 +288,9 @@ class AtomicityChecker:
         self.conn_locks = {}
         for i in range(1, self.num_transactions + 1):
             self.conn_locks[i] = threading.Lock()
+        
+        # for i in range(1, self.num_transactions + 1):
+        #     self.sp_snapshot[i] = {}
 
     def _init_connections(self, actual_trx_ids: Set[int]):
         """为每个事务创建独立的数据库连接"""
@@ -305,29 +311,125 @@ class AtomicityChecker:
         for trx_id in actual_trx_ids:
             self.connections[trx_id].close()
 
-    def execute_stmt_async(self, trx_id: int, stmt: str, result_queue: queue.Queue, terminate_event: threading.Event, cleaned: bool):
+    def _execute_stmt_async(self, trx_id: int, stmt: str, result_queue: queue.Queue, terminate_event: threading.Event, 
+                            cleaned: bool, local_executed_serial: List, local_cleaned_executed_serial: List):
         """异步执行SQL语句"""
         def _execute():
             nonlocal trx_id
             nonlocal stmt
+            nonlocal local_executed_serial
+            nonlocal local_cleaned_executed_serial
+            
             conn = self.connections[trx_id]
             lock = self.conn_locks[trx_id]
             try:
                 with lock:
                     cursor = conn.cursor(buffered=True)
-                    cursor.execute(stmt)
-                    if stmt.strip().upper().startswith("SELECT"):
-                        cursor.fetchall()
+                    if stmt.strip().upper().startswith("CALL"):
+                        # 解析存储过程调用语句
+                        # 去除CALL和括号，得到存储过程名称和参数
+                        proc_parts = stmt.strip()[5:].strip().split('(', 1)
+                        proc_name = proc_parts[0].strip()
+                        
+                        # 提取参数字符串并移除最后的括号
+                        params_str = proc_parts[1].rsplit(')', 1)[0] if len(proc_parts) > 1 else ""
+                        
+                        # 将参数字符串转换为参数列表
+                        params = []
+                        if params_str:
+                            # 分割参数并处理每个参数
+                            for param in params_str.split(','):
+                                param = param.strip()
+                                # 尝试转换为数字
+                                try:
+                                    # 尝试转换为整数
+                                    params.append(int(param))
+                                except ValueError:
+                                    try:
+                                        # 尝试转换为浮点数
+                                        params.append(float(param))
+                                    except ValueError:
+                                        # 如果不是数字，移除引号后作为字符串
+                                        params.append(param.strip('"\''))
+                    
+                        try:
+                            # 执行存储过程
+                            result = cursor.callproc(proc_name, tuple(params))
+                        
+                        except mysql.connector.Error as err:
+                            logger.error(f"执行存储过程失败: {err}, stmt: {stmt}")
+                            raise
+                    else:
+                        try:
+                            if stmt.strip().upper().startswith("ROLLBACK --"):
+                                cursor.execute("ROLLBACK")
+                            else:
+                                cursor.execute(stmt)
+                                
+                            if stmt.strip().upper().startswith("SELECT"):
+                                cursor.fetchall()
+                            # 如果是SAVEPOINT语句，需要此时保存快照，以便后续对比
+                            if "ROLLBACK TO" in stmt.strip().upper():
+                                sp_id = stmt.strip().split()[-1]
+                                # 尝试获取savepoint，如果不存在则继续而不是失败
+                                try:
+                                    # snapshot = self._take_snapshot(conn)
+                                    # self.sp_snapshot[trx_id][sp_id] = snapshot
+                                    # logger.info(f"     事务{trx_id}回滚至savepoint {sp_id}后保存快照")
+                                    pass
+                                except mysql.connector.Error as sp_err:
+                                    if sp_err.errno == 1305:  # Savepoint不存在错误
+                                        logger.warning(f"     SAVEPOINT {sp_id}不存在，跳过此回滚操作")
+                                        # 记录一个空快照或使用最新的快照
+                                        # snapshot = self._take_snapshot(conn)
+                                        # self.sp_snapshot[trx_id][sp_id] = snapshot
+                                    else:
+                                        raise
+                            elif "ROLLBACK" == stmt.strip().upper():
+                                # snapshot = self._take_snapshot(conn)
+                                # self.rollback_snapshot[trx_id] = snapshot
+                                # logger.info(f"     事务{trx_id}回滚后保存快照")
+                                pass
+                        except mysql.connector.Error as err:
+                            if err.errno == 1305:  # Savepoint不存在错误
+                                logger.warning(f"     不存在: {err}, 继续执行")
+                                # 这里不抛出异常，而是视为成功执行
+                                # 记录当前数据库状态作为rollback的结果
+                                if "ROLLBACK TO" in stmt.strip().upper():
+                                    # sp_id = stmt.strip().split()[-1]
+                                    # snapshot = self._take_snapshot(conn)
+                                    # self.sp_snapshot[trx_id][sp_id] = snapshot
+                                    pass
+                            elif err.errno == 1292:# 1292是数据类型错误(Truncated incorrect DOUBLE value)，1062是重复插入错误(Duplicate entry)
+                                logger.warning(f"     执行失败: {err}，视为成功执行")
+                                # 这里不抛出异常，而是视为成功执行
+                            elif err.errno == 1062:
+                                logger.warning(f"     执行失败: {err}，视为成功执行")
+                                # 这里不抛出异常，而是视为成功执行
+                            else:
+                                raise
+
                 result_queue.put(("success", None))
-                self.executed_serial.append((trx_id, stmt)) if not cleaned else None
-                self.cleaned_executed_serial.append((trx_id, stmt)) if cleaned else None
+
+                # 使用传入的局部变量记录执行序列
+                if not cleaned:
+                    local_executed_serial.append((trx_id, stmt))
+                else:
+                    local_cleaned_executed_serial.append((trx_id, stmt))
                 cursor.close()
             except mysql.connector.Error as err:
                 if err.errno == 1213:
                     logger.error(f"     异步执行死锁: {err}, stmt: {stmt}")
-                    self.executed_serial.append((trx_id, f"ROLLBACK --{stmt}")) if not cleaned else None
-                    self.cleaned_executed_serial.append((trx_id, f"ROLLBACK --{stmt}")) if cleaned else None
+                    if not cleaned:
+                        local_executed_serial.append((trx_id, f"ROLLBACK --{stmt}"))
+                    else:
+                        local_cleaned_executed_serial.append((trx_id, f"ROLLBACK --{stmt}"))
                     terminate_event.set()
+                    # 快照
+                    # snapshot = self._take_snapshot(conn)
+                    # self.rollback_snapshot[trx_id] = snapshot
+                    # logger.info(f"     事务{trx_id}死锁回滚后保存快照")
+
                 else:
                     logger.error(f"     异步执行非死锁错误: {err}, stmt: {stmt}")
                 result_queue.put(("error", err))
@@ -338,22 +440,26 @@ class AtomicityChecker:
                 if terminate_event.is_set():
                     logger.info(f"      终止事务{trx_id}的pending语句: {stmt}")
                     return
-                
+            
         thread = threading.Thread(target=_execute)
         thread.start()
         return thread
     
 
-    def _execute_serial(self, serial: List[Tuple[int, str]], cleaned: bool) -> Tuple[bool, Set[int], List[Tuple[int, str]], List[Tuple[int, str]]]:
+    def _execute_serial(self, serial: List[Tuple[int, str]], cleaned: bool, sub_check_point: bool) -> Tuple[bool, Set[int], List[Tuple[int, str]], List[Tuple[int, str]]]:
         """使用多个独立连接按序执行事务场景
         
         Args:
             serial: 死锁场景的执行序列，格式为[(事务ID, SQL语句), ...]
         
         Returns:
-            Tuple[bool, Optional[int], List[Tuple]]: 是否成功执行所有语句(死锁或错误会返回False), 回滚的事务ID, 执行序列
+            Tuple[bool, Set[int], List[Tuple[int, str]], List[Tuple[int, str]]]: 是否成功执行所有语句, 回滚的事务ID, 执行序列, 实际提交序列
         """
-
+        
+        # 为每个子检查点创建独立的执行序列记录
+        local_executed_serial = []
+        local_cleaned_executed_serial = []
+        
         try:
             actual_trx_ids = set(tx_id for tx_id, _ in serial)
             self._init_connections(actual_trx_ids)
@@ -362,18 +468,16 @@ class AtomicityChecker:
 
             # 记录每个事务当前执行到的位置
             idx = 0
-            # executed_serial = []
             actual_submitted_serial = []
             logged_serial = []
 
-            self.executed_serial = [] if not cleaned else self.executed_serial
-            self.pending_stmts = {}
-            self.trx_in_pending = set()
-            self.result_queues = {}
-            self.rollback_trx_ids = set()
+            # 使用局部变量而不是类成员变量
+            pending_stmts = {}
+            trx_in_pending = set()
+            result_queues = {}
+            rollback_trx_ids = set()
 
             # 记录被阻塞的事务ID
-            rollback_trx_ids = set()
             blocked_trx_ids = set()
             blocked_stmts = {}
 
@@ -383,8 +487,8 @@ class AtomicityChecker:
                 logger.info(f"idx: {idx}")
 
                 # 记录pending_stmts中是否已有对应事务语句
-                logger.info(f"-------------首先检查是否可调度阻塞语句-------------")
-                logger.info(f"调度前：阻塞队列:{blocked_stmts}")
+                logger.info(f"-------------1. 检查是否可调度阻塞语句-------------")
+                logger.info(f"检查前：阻塞队列:{blocked_stmts}")
                 diaodu_flag = False
                 diaodu_sql = None
                 diaodu_trx = None
@@ -396,9 +500,10 @@ class AtomicityChecker:
                             # 为那些阻塞结束的事务分配线程，每个事务一次最多一条语句
                             result_queue = queue.Queue()
                             terminate_event = self.terminate_events[trx_id]
-                            thread = self.execute_stmt_async(trx_id, stmt, result_queue, terminate_event, cleaned)
-                            self.pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
-                            self.result_queues[stmt_idx] = result_queue
+                            thread = self._execute_stmt_async(trx_id, stmt, result_queue, terminate_event, 
+                                                             cleaned, local_executed_serial, local_cleaned_executed_serial)
+                            pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
+                            result_queues[stmt_idx] = result_queue
                             actual_submitted_serial.append((trx_id, stmt))
                             diaodu_sql = stmt
                             diaodu_trx = trx_id
@@ -408,7 +513,7 @@ class AtomicityChecker:
                             diaodu_flag = True
                             break
                 if diaodu_flag:
-                    logger.info(f"成功调度{diaodu_trx}:{diaodu_sql}调度后：{blocked_stmts}")
+                    logger.info(f"成功调度{diaodu_trx}:{diaodu_sql}调度后阻塞队列：{blocked_stmts}")
                 else:
                     if len(blocked_trx_ids) == 0 and len(blocked_stmts) == 0:
                         logger.info("当前无阻塞事务和阻塞语句")
@@ -420,12 +525,12 @@ class AtomicityChecker:
 
                 try:
                     if idx >= len(serial):
-                        logger.info(f"序列遍历完成，开始查看剩余阻塞的语句：{self.pending_stmts}")
+                        logger.info(f"序列遍历完成，开始查看剩余阻塞的语句：{pending_stmts}")
                         break
                     
                     # 启动新的语句执行
                     if idx < len(serial) and diaodu_flag == False: # 如果本轮没有调度任何语句，则开始遍历新语句
-                        logger.info(f"-------------开始遍历新语句-------------")
+                        logger.info(f"-------------2. 遍历新语句-------------")
                         trx_id, stmt = serial[idx]
                         if stmt is None:
                             logger.error(f"stmt为None, trx_id: {trx_id}, stmt: {stmt}")
@@ -434,17 +539,15 @@ class AtomicityChecker:
 
                         # 如果该事务已被回滚，跳过不执行
                         if rollback_trx_ids and trx_id in rollback_trx_ids:
-                            # executed_serial.append((trx_id, f"--Skipped, trx_id: {trx_id}, stmt: {stmt}"))
                             logged_serial.append((trx_id, f"--Skipped, trx_id: {trx_id}, stmt: {stmt}"))
                             logger.error(f"事务{trx_id}已回滚，跳过执行{stmt}")
 
-                            pending_stmts_copy = self.pending_stmts.copy()
+                            pending_stmts_copy = pending_stmts.copy()
                             for s_idx, (trx_id1, stmt1, thread1, _) in pending_stmts_copy.items():
                                 if trx_id1 == trx_id:
-                                    del self.pending_stmts[s_idx]
-                                    del self.result_queues[s_idx]
-                            self.trx_in_pending.remove(trx_id) if trx_id in self.trx_in_pending else None
-                            # blocked_trx_ids.remove(trx_id) if trx_id in blocked_trx_ids else None
+                                    del pending_stmts[s_idx]
+                                    del result_queues[s_idx]
+                            trx_in_pending.remove(trx_id) if trx_id in trx_in_pending else None
                             
                             # 移除那个被回滚事务的blocking语句
                             blocked_stmts_copy = blocked_stmts.copy()
@@ -454,7 +557,7 @@ class AtomicityChecker:
                                     del blocked_stmts[s_idx]
                             idx += 1
                             continue
-                            
+                        
                         # 如果该事务当前已被阻塞
                         if blocked_trx_ids and trx_id in blocked_trx_ids:
                             # 先不给他分配线程，加入等待队列blocked_stmts
@@ -465,31 +568,31 @@ class AtomicityChecker:
                         # 为新语句创建结果队列并启动执行
                         result_queue = queue.Queue()
                         terminate_event = self.terminate_events[trx_id]
-                        thread = self.execute_stmt_async(trx_id, stmt, result_queue, terminate_event, cleaned)
-                        self.pending_stmts[idx] = (trx_id, stmt, thread, time.time())
-                        self.result_queues[idx] = result_queue
-                        self.trx_in_pending.add(trx_id)
+                        thread = self._execute_stmt_async(trx_id, stmt, result_queue, terminate_event, 
+                                                         cleaned, local_executed_serial, local_cleaned_executed_serial)
+                        pending_stmts[idx] = (trx_id, stmt, thread, time.time())
+                        result_queues[idx] = result_queue
+                        trx_in_pending.add(trx_id)
                         actual_submitted_serial.append((trx_id, stmt))
                         idx += 1
                         logger.info(f"创建新语句任务成功，trx_id: {trx_id}, stmt: {stmt}")
-                        logger.info(f"-------------遍历新语句结束-------------")
-                    logger.info("")
+                        logger.info(f"-------------2. 遍历新语句结束-------------")
+                        logger.info("")
 
-                    logger.info(f"-------------开始周期性检查pending语句的执行结果-------------")
-                    logger.info(f"执行前idx: {idx}, pending_stmts: {self.pending_stmts}")
+                    logger.info(f"-------------3. 检查pending语句的执行结果-------------")
+                    logger.info(f"检查前pending_stmts: {pending_stmts}")
                     
                     
-                    stmt_indices = list(self.pending_stmts.keys())
+                    stmt_indices = list(pending_stmts.keys())
                     for key in stmt_indices:
                         # 检查key是否还存在于pending_stmts中
-                        if key not in self.pending_stmts:
+                        if key not in pending_stmts:
                             continue
-                            
+                        
                         # 非阻塞方式检查结果
                         time.sleep(0.1)
-                        t, sql, thd, _ = self.pending_stmts[key]
-                        # status, result = self.result_queues[stmt_idx].get_nowait()
-                        result_queue = self.result_queues[key]
+                        t, sql, thd, _ = pending_stmts[key]
+                        result_queue = result_queues[key]
                         if result_queue.empty():
                             # 说明wait for lock
                             print(f"wait for lock, trx_id: {t}, stmt: {sql}")
@@ -504,17 +607,20 @@ class AtomicityChecker:
                         status, result = result_queue.get_nowait()
                         
                         if status == "success":
-                            # executed_serial.append((t, sql))
                             logged_serial.append((t, sql))
                             logger.info(f"成功执行序列中事务{t}语句: {sql}")
 
-                            del self.pending_stmts[key]
-                            del self.result_queues[key]
+                            del pending_stmts[key]
+                            del result_queues[key]
 
-                            logger.info(f"trx_in_pending: {self.trx_in_pending}")
-                            logger.info(f"blocked_trx_ids: {blocked_trx_ids}")
-                            self.trx_in_pending.remove(t) if t in self.trx_in_pending else None
+                            logger.info(f"trx_in_pending_before: {trx_in_pending}")
+                            logger.info(f"blocked_trx_ids_before: {blocked_trx_ids}")
+
+                            trx_in_pending.remove(t) if t in trx_in_pending else None
                             blocked_trx_ids.remove(t) if t in blocked_trx_ids else None
+
+                            logger.info(f"trx_in_pending_after: {trx_in_pending}")
+                            logger.info(f"blocked_trx_ids_after: {blocked_trx_ids}")
 
                             if sql == "ROLLBACK":
                                 rollback_trx_ids.add(t)
@@ -529,12 +635,12 @@ class AtomicityChecker:
                                 logger.error(f"死锁错误: {result}，事务{t}语句: {sql}")
                                 rollback_trx_ids.add(t)
 
-                                pending_stmts_copy = self.pending_stmts.copy()
+                                pending_stmts_copy = pending_stmts.copy()
                                 for s_idx, (trx_id1, stmt1, thread1, _) in pending_stmts_copy.items():
                                     if trx_id1 == t:
-                                        del self.pending_stmts[s_idx]
-                                        del self.result_queues[s_idx]
-                                self.trx_in_pending.remove(t) if t in self.trx_in_pending else None
+                                        del pending_stmts[s_idx]
+                                        del result_queues[s_idx]
+                                trx_in_pending.remove(t) if t in trx_in_pending else None
                                 blocked_trx_ids.add(t)
                                 
                                 # 移除那个被回滚事务的blocking语句
@@ -544,17 +650,19 @@ class AtomicityChecker:
                                         del blocked_stmts[s_idx]
                                 blocked_trx_ids.remove(trx_id1)
 
-                                if not cleaned:
+                                if not cleaned and not sub_check_point:
+                                    # 第一次执行的完整主序列
                                     self.rollback_trx_ids = rollback_trx_ids
-                                # executed_serial.append((t, "ROLLBACK"))
+
                                 logged_serial.append((t, f"-- Cause Deadlock, Rollback. {sql}"))
+                                
                             else:
                                 logged_serial.append((t, f"-- Error and skipped: {sql}, {result}"))
                                 # 跳过该语句,并终止该事务的pending线程
                                 thread.join(timeout=0.001)
-                                del self.pending_stmts[key]
-                                del self.result_queues[key]
-                                self.trx_in_pending.remove(t) if t in self.trx_in_pending else None
+                                del pending_stmts[key]
+                                del result_queues[key]
+                                trx_in_pending.remove(t) if t in trx_in_pending else None
                                 blocked_trx_ids.remove(t) if t in blocked_trx_ids else None
                                 logger.error(f"执行语句失败，非死锁错误: {result}，事务{t}语句: {sql}")
                                 
@@ -563,17 +671,17 @@ class AtomicityChecker:
 
 
                     # 短暂休眠避免CPU占用过高
-                    logger.info(f"执行后idx: {idx}, pending_stmts: {self.pending_stmts}")
-                    logger.info(f"-------------周期性检查结果队列结束-------------")
+                    logger.info(f"检查后pending_stmts: {pending_stmts}")
+                    logger.info(f"-------------3. 检查结果队列结束-------------")
                     logger.info("")
                     time.sleep(0.1)
                 except Exception as e:
                     logger.error(f"错误: {e}")
 
-            while len(self.pending_stmts)>0 or len(blocked_stmts)>0:
+            while len(pending_stmts)>0 or len(blocked_stmts)>0:
                 # 记录pending_stmts中是否已有对应事务语句
-                logger.info(f"-------------首先检查是否可调度阻塞语句-------------")
-                logger.info(f"调度前阻塞队列：{blocked_stmts}")
+                logger.info(f"-------------4. 检查是否可调度阻塞语句-------------")
+                logger.info(f"检查前阻塞队列：{blocked_stmts}")
                 diaodu_flag = False
                 diaodu_sql = None
                 diaodu_trx = None
@@ -581,14 +689,15 @@ class AtomicityChecker:
                     # 如果阻塞语句队列能被调度，优先执行阻塞的语句
                     blocked_stmts_copy = blocked_stmts.copy()
                     for stmt_idx, (trx_id, stmt) in blocked_stmts_copy.items():
-                        if trx_id not in blocked_trx_ids and trx_id not in self.trx_in_pending:
+                        if trx_id not in blocked_trx_ids and trx_id not in trx_in_pending:
                             # 为那些阻塞结束的事务分配线程，每个事务一次最多一条语句
                             result_queue = queue.Queue()
                             terminate_event = self.terminate_events[trx_id]
-                            thread = self.execute_stmt_async(trx_id, stmt, result_queue, terminate_event, cleaned)
-                            self.pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
-                            self.result_queues[stmt_idx] = result_queue
-                            self.trx_in_pending.add(trx_id)
+                            thread = self._execute_stmt_async(trx_id, stmt, result_queue, terminate_event, 
+                                                             cleaned, local_executed_serial, local_cleaned_executed_serial)
+                            pending_stmts[stmt_idx] = (trx_id, stmt, thread, time.time())
+                            result_queues[stmt_idx] = result_queue
+                            trx_in_pending.add(trx_id)
                             actual_submitted_serial.append((trx_id, stmt))
                             diaodu_sql = stmt
                             diaodu_trx = trx_id
@@ -603,20 +712,19 @@ class AtomicityChecker:
                 else:
                     logger.info(f"{blocked_trx_ids}都正被阻塞，无法调度")
                     
-                logger.info(f"-------------调度阻塞语句结束-------------")
+                logger.info(f"-------------4. 调度阻塞语句结束-------------")
                 logger.info("")
                 # 专注于剩下的pending_stmt
-                stmt_indices = list(self.pending_stmts.keys())
+                stmt_indices = list(pending_stmts.keys())
                 for key in stmt_indices:
                     # 检查key是否还存在于pending_stmts中
-                    if key not in self.pending_stmts:
+                    if key not in pending_stmts:
                         continue
                         
                     # 非阻塞方式检查结果
                     time.sleep(0.1)
-                    t, sql, thd, _ = self.pending_stmts[key]
-                    # status, result = self.result_queues[stmt_idx].get_nowait()
-                    result_queue = self.result_queues[key]
+                    t, sql, thd, _ = pending_stmts[key]
+                    result_queue = result_queues[key]
                     if result_queue.empty():
                         # 说明wait for lock
                         print(f"wait for lock, trx_id: {t}, stmt: {sql}")
@@ -631,15 +739,18 @@ class AtomicityChecker:
                     status, result = result_queue.get_nowait()
                     
                     if status == "success":
-                        # executed_serial.append((t, sql))
                         logged_serial.append((t, sql))
                         logger.info(f"成功执行序列中事务{t}语句: {sql}")
-                        del self.pending_stmts[key]
-                        del self.result_queues[key]
-                        logger.info(f"trx_in_pending: {self.trx_in_pending}")
-                        logger.info(f"blocked_trx_ids: {blocked_trx_ids}")
-                        self.trx_in_pending.remove(t) if t in self.trx_in_pending else None
+                        del pending_stmts[key]
+                        del result_queues[key]
+                        logger.info(f"trx_in_pending_before: {trx_in_pending}")
+                        logger.info(f"blocked_trx_ids_before: {blocked_trx_ids}")
+                        
+                        trx_in_pending.remove(t) if t in trx_in_pending else None
                         blocked_trx_ids.remove(t) if t in blocked_trx_ids else None
+
+                        logger.info(f"trx_in_pending_after: {trx_in_pending}")
+                        logger.info(f"blocked_trx_ids_after: {blocked_trx_ids}")
 
                         if sql == "ROLLBACK":
                             rollback_trx_ids.add(t)
@@ -654,44 +765,51 @@ class AtomicityChecker:
                             logger.error(f"死锁错误: {result}，事务{t}语句: {sql}")
                             rollback_trx_ids.add(t)
 
-                            pending_stmts_copy = self.pending_stmts.copy()
+                            pending_stmts_copy = pending_stmts.copy()
                             for s_idx, (trx_id1, stmt1, thread1, _) in pending_stmts_copy.items():
                                 if trx_id1 == t:
-                                    del self.pending_stmts[s_idx]
-                                    del self.result_queues[s_idx]
-                            self.trx_in_pending.remove(t) if t in self.trx_in_pending else None
+                                    del pending_stmts[s_idx]
+                                    del result_queues[s_idx]
+                            trx_in_pending.remove(t) if t in trx_in_pending else None
                             blocked_trx_ids.add(t)
                             
                             # 移除那个被回滚事务的blocking语句
                             blocked_stmts_copy = blocked_stmts.copy()
                             for s_idx, (trx_id1, stmt1) in blocked_stmts_copy.items():
                                 if trx_id1 in rollback_trx_ids and trx_id1 in blocked_trx_ids:
-                                    blocked_trx_ids.remove(trx_id1)
                                     del blocked_stmts[s_idx]
+                                blocked_trx_ids.remove(trx_id1)
 
-                            # 如果不是cleaned_serial，即是serial的执行
-                            if not cleaned:
+                            if not cleaned and not sub_check_point:
                                 self.rollback_trx_ids = rollback_trx_ids
-                            # executed_serial.append((t, "ROLLBACK"))
+
                             logged_serial.append((t, f"-- Cause Deadlock, Rollback. {sql}"))
+                            
+                        
                         else:
                             logged_serial.append((t, f"-- Error and skipped: {sql}, {result}"))
                             # 跳过该语句,并终止该事务的pending线程
                             thread.join(timeout=0.001)
-                            del self.pending_stmts[key]
-                            del self.result_queues[key]
-                            self.trx_in_pending.remove(t) if t in self.trx_in_pending else None
+                            del pending_stmts[key]
+                            del result_queues[key]
+                            trx_in_pending.remove(t) if t in trx_in_pending else None
                             blocked_trx_ids.remove(t) if t in blocked_trx_ids else None
                             logger.error(f"执行语句失败，非死锁错误: {result}，事务{t}语句: {sql}")
 
                             if result.errno == 1205:
                                 return False, set(), [], []
+
+            if not sub_check_point:
+                if not cleaned:
+                    self.executed_serial = local_executed_serial
+                else:
+                    self.cleaned_executed_serial = local_cleaned_executed_serial
             
             # 所有语句执行完毕后,根据是否发生死锁返回结果
             if rollback_trx_ids:
-                return False, set(rollback_trx_ids), self.executed_serial if not cleaned else self.cleaned_executed_serial, actual_submitted_serial
+                return False, set(rollback_trx_ids), local_executed_serial, actual_submitted_serial
             else:
-                return True, set(), self.executed_serial if not cleaned else self.cleaned_executed_serial, actual_submitted_serial
+                return True, set(), local_executed_serial, actual_submitted_serial
         
         except Exception as e:
             logger.error(f"执行序列发生错误: {e}")
@@ -704,11 +822,11 @@ class AtomicityChecker:
                     conn.close()
                 except Exception as e:
                     logger.error(f"关闭连接失败: {e}")
-            
-    def check_atomicity(self, trx_sqls: Dict[int, List[str]], 
-                       serial: List[Tuple[int, str]], 
-                       ) -> Tuple[bool, str, List[Tuple[int, str]], List[Tuple[int, str]], List[Tuple[int, str]]]:
+
+    def check_atomicity(self, trx_sqls: Dict[int, List[str]], serial: List[Tuple[int, str]], temp_env_dir: str) -> Tuple[bool, str, List[Tuple[int, str]], List[Tuple[int, str]], List[Tuple[int, str]]]:
         """检查事务序列的原子性"""
+
+        
         try:
             logger.info(f"执行序列: {serial}")
             logger.info(f"trx_sqls: {trx_sqls}")
@@ -719,83 +837,242 @@ class AtomicityChecker:
                 conn.close()
                 
                 # 执行原始序列
-                success, rollback_trx_ids, executed_serial, actual_submitted_serial = self._execute_serial(serial, cleaned=False)
+                success, rollback_trx_ids, executed_serial, actual_submitted_serial = self._execute_serial(serial, cleaned=False, sub_check_point=False)
             except Exception as e:
                 logger.error(f"执行序列失败: {e}")
                 return False, str(e), [], [], []
                 
-            # 如果执行成功且没有回滚的事务，即未发生死锁，直接返回，这个测例无效，如果发生死锁，才需要检查原子性
+            # 如果执行成功且没有回滚的事务，即未发生死锁，直接返回，这个测例无效
             if success and len(rollback_trx_ids) == 0:
                 logger.info(f"执行序列成功，未发生死锁和手动ROLLBACK，无效test case")
                 print(f"执行序列成功，未发生死锁和手动ROLLBACK，无效test case")
                 return True, None, serial, [], []
+            else:
+                # 保存并发执行后的数据库状态
+                conn = self._create_slave_connection()
+                self.snapshot_serial = self._take_snapshot(conn)
+                conn.close()
 
-            # 保存并发执行后的数据库状态
-            conn = self._create_slave_connection()
-            self.snapshot_serial = self._take_snapshot(conn)
-            conn.close()
-
-            # 获取成功和失败的事务集合
-            rolled_back_trxs = set(rollback_trx_ids) if rollback_trx_ids else set()
-            # 从self.num_transactions中减去rolled_back_trxs
-            committed_trxs = set(range(1, self.num_transactions + 1)) - rolled_back_trxs
-            self.executed_serial = executed_serial
+                # 获取成功和失败的事务集合
+                rolled_back_trxs = set(rollback_trx_ids) if rollback_trx_ids else set()
+                # 从self.num_transactions中减去rolled_back_trxs
+                committed_trxs = set(range(1, self.num_transactions + 1)) - rolled_back_trxs
+                self.executed_serial = executed_serial
+                self.rollback_trx_ids = rolled_back_trxs
                         
-            logger.info(f"被回滚的事务: {sorted(list(rolled_back_trxs))}")
-            logger.info(f"成功提交的事务: {sorted(list(committed_trxs))}")
-            
-            cleaned_serial = []
-            tx_rolled_back = set()
-            # for trx_id, stmt in serial:
-            for trx_id, stmt in self.executed_serial:
-            # for trx_id, stmt in actual_submitted_serial:
-                if trx_id in rolled_back_trxs:
-                    if trx_id not in tx_rolled_back:
-                        if stmt.startswith("ROLLBACK"):
-                            tx_rolled_back.add(trx_id)
-                        else:
-                            continue
-                    else:
-                        cleaned_serial.append((trx_id, stmt))
-                else:
-                    cleaned_serial.append((trx_id, stmt))
-            
-            # 检查cleaned_serial是否等价于serial
-            try:
-                self._restore_initial_state()
-                logger.info("恢复初始状态成功")
-            except Exception as e:
-                logger.error(f"恢复初始状态失败: {e}")
-                return False, str(e), [], []
-
-            logger.info(f"清理前的序列: {self.executed_serial}")
-            logger.info(f"清理后的序列: {cleaned_serial}")
-            cleaned_success, cleaned_rollback_trx_ids, cleaned_executed_serial, cleaned_actual_submitted_serial = self._execute_serial(cleaned_serial, cleaned=True)
-            logger.info(f"清理后的序列执行成功: {cleaned_success}")
-            
-            if not cleaned_success:
-                error_msg = "清理后的序列仍存在死锁"
-                logger.error(error_msg)
+                logger.info(f"被回滚的事务: {sorted(list(rolled_back_trxs))}")
+                logger.info(f"成功提交的事务: {sorted(list(committed_trxs))}")
                 
-            # 获取清理后序列的执行状态
-            conn = self._create_slave_connection()
-            self.snapshot_cleaned = self._take_snapshot(conn)
-            conn.close()
-            
-            # 比较两次执行的结果
-            if not self._compare_snapshots(self.snapshot_serial, self.snapshot_cleaned):
-                error_msg = (
-                    "违反原子性：\n"
-                    f"serial执行状态: {self.snapshot_serial}\n"
-                    f"cleaned_serial执行状态: {self.snapshot_cleaned}"
-                )
-                logger.error(error_msg)
-                return False, error_msg, self.executed_serial, cleaned_serial, actual_submitted_serial
-            return True, None, self.executed_serial, cleaned_serial, actual_submitted_serial
-            
-        except Exception as e:
-            logger.error(f"检查原子性过程发生错误: {e}")
-            return False, str(e), [], [], []
+                # cleaned_serial = []
+                # tx_rolled_back = set()
+                # 获取cleaned_serial
+                # for trx_id, stmt in self.executed_serial:
+                #     if trx_id in rolled_back_trxs:
+                #         if trx_id not in tx_rolled_back:
+                #             if stmt.startswith("ROLLBACK"):
+                #                 tx_rolled_back.add(trx_id)
+                #             else:
+                #                 continue
+                #         else:
+                #             cleaned_serial.append((trx_id, stmt))
+                #     else:
+                #         cleaned_serial.append((trx_id, stmt))
+                cleaned_serial = []
+                del_idx = []
+                
+
+                # 首先遍历找出所有回滚操作
+                rollback_points = []  # [(idx, trx_id, type, savepoint_id)]
+                for idx, (trx_id, stmt) in enumerate(self.executed_serial):
+                    if "ROLLBACK TO" in stmt.strip().upper():
+                        savepoint_id = stmt.strip().split()[-1]
+                        rollback_points.append((idx, trx_id, "ROLLBACK_TO", savepoint_id))
+                    elif stmt.startswith("ROLLBACK"): # 手动ROLLBACK或者ROLLBACK --表示因为死锁回滚的
+                        rollback_points.append((idx, trx_id, "ROLLBACK", None))
+
+                # 为每个回滚点生成对应的cleaned_serial
+                checkpoint_seq_pair = []# 保存sub_serial和sub_cleaned_serial
+                for idx, trx_id, rollback_type, savepoint_id in rollback_points:
+                    current_del_idx = set()
+                    
+                    current_sub_serial = self.executed_serial[:idx + 1]
+
+                    if rollback_type == "ROLLBACK_TO":
+                        # 找到对应的SAVEPOINT定义点
+                        for i in range(idx - 1, -1, -1):
+                            prev_trx_id, prev_stmt = current_sub_serial[i]
+                            if prev_stmt.startswith(f"SAVEPOINT {savepoint_id}"):
+                                sp_idx = i
+                                break
+                        
+                        # 标记需要删除的语句
+                        for i in range(sp_idx, idx + 1):
+                            if trx_id == current_sub_serial[i][0]:
+                                current_del_idx.add(i)
+                    
+                    elif rollback_type == "ROLLBACK":
+                        # 标记该事务之前的所有语句
+                        for i in range(0, idx + 1):
+                            if trx_id == current_sub_serial[i][0]:
+                                current_del_idx.add(i)
+
+
+                    # 生成当前回滚点的cleaned_serial
+                    current_sub_cleaned_serial = []
+                    for i, (t_id, stmt) in enumerate(current_sub_serial):
+                        if i not in current_del_idx:
+                            current_sub_cleaned_serial.append((t_id, stmt))
+                    
+
+                    # 更新checkpoint_seq_pair
+                    checkpoint_seq_pair.append((current_sub_serial, current_sub_cleaned_serial))
+
+                    # 更新总的del_idx
+                    del_idx.extend(current_del_idx)
+
+                # 生成最终的cleaned_serial
+                del_idx = set(del_idx)  # 转换为集合去重
+                for idx, (trx_id, stmt) in enumerate(self.executed_serial):
+                    if idx not in del_idx:
+                        cleaned_serial.append((trx_id, stmt))
+
+                
+                # # 更新checkpoint_pair并进行子检查点验证
+                # self.sub_cleaned_serial_checkpoint_pair = []
+                # for idx, (rollback_idx, trx_id, rollback_type, savepoint_id) in enumerate(rollback_points):
+                #     key = f"{trx_id}_{rollback_type}_{savepoint_id if savepoint_id else ''}"
+                #     sub_cleaned = sub_cleaned_serials[key]
+                #     self.sub_cleaned_serial_checkpoint_pair.append((rollback_idx + 1, len(sub_cleaned)))
+
+                # # 补充手动ROLLBACK或ROLLBACK TO SAVEPOINT的checkpoint_pair
+                # for i in range(len(self.sub_cleaned_serial_checkpoint_pair)):
+                #     checkpoint_idx = self.sub_cleaned_serial_checkpoint_pair[i][0]
+                #     rollback_stmt_idx = checkpoint_idx - 1
+                #     # 找到rollback语句前面最近的一条语句在cleaned_serial中的位置
+                #     c = rollback_stmt_idx - 1
+                #     found = False
+                #     while c >= 0:
+                #         for idx, (trx_id, stmt) in enumerate(cleaned_serial):
+                #             if self.executed_serial[c] == (trx_id, stmt):
+                #                 self.sub_cleaned_serial_checkpoint_pair[i] = (checkpoint_idx, idx + 1)
+                #                 found = True
+                #                 break
+                #         if found:
+                #             break
+                #         c -= 1
+                #     if not found:
+                #         logger.warning(f"无法为checkpoint_pair[{i}]找到合适的cpt2值，原值: {self.sub_cleaned_serial_checkpoint_pair[i]}，赋值为0")
+                #         self.sub_cleaned_serial_checkpoint_pair[i] = (checkpoint_idx, 0)
+
+                # logger.info(f"checkpoint_pair: {self.sub_cleaned_serial_checkpoint_pair}")
+                self.sub_checkpoint_pair = checkpoint_seq_pair
+                logger.info(f"checkpoint_seq_pair: {self.sub_checkpoint_pair}")
+
+                # 检查cleaned_serial是否等价于serial
+                try:
+                    self._restore_initial_state(temp_env_dir)
+                    logger.info("恢复初始状态成功")
+                except Exception as e:
+                    logger.error(f"恢复初始状态失败: {e}")
+                    return False, str(e), [], [], []
+
+                logger.info(f"清理前的序列: {self.executed_serial}")
+                logger.info(f"清理后的序列: {cleaned_serial}")
+                cleaned_success, cleaned_rollback_trx_ids, cleaned_executed_serial, cleaned_actual_submitted_serial = self._execute_serial(cleaned_serial, cleaned=True, sub_check_point=False)
+                logger.info(f"清理后的序列执行成功: {cleaned_success}")
+                
+                    
+                # 获取清理后序列的执行状态
+                conn = self._create_slave_connection()
+                self.snapshot_cleaned = self._take_snapshot(conn)
+                conn.close()
+                
+                # 1. 整体原子性检查
+                res = True  # 用于记录整体检查结果
+                error_msg = ""  # 用于累积错误信息
+                
+                if not self._compare_snapshots(self.snapshot_serial, self.snapshot_cleaned):
+                    error_msg += (
+                        "整体违反原子性：\n"
+                        f"serial执行状态: {self.snapshot_serial}\n"
+                        f"cleaned_serial执行状态: {self.snapshot_cleaned}\n"
+                        f"执行序列: {self.executed_serial}\n"
+                        f"清理后序列: {cleaned_serial}\n\n"
+                    )
+                    res = False
+                    logger.error(error_msg)
+
+                # 2. 子检查点原子性检查
+                for idx, (sub_serial, sub_cleaned_serial) in enumerate(self.sub_checkpoint_pair):
+                    
+                    # 找到对应的sub_cleaned_serial
+                    logger.info(f"子检查点{idx}, cpt1: {len(sub_serial)}, cpt2: {len(sub_cleaned_serial)}")
+                    logger.info(f"sub_serial: {sub_serial}")
+                    logger.info(f"sub_cleaned_serial: {sub_cleaned_serial}")
+
+                    self._restore_initial_state(temp_env_dir)
+                    
+                    # 分别执行sub_executed_serial和sub_cleaned_serial并获取快照
+                    # 执行sub_serial
+                    sub_success, sub_rollback_ids, sub_actual_executed, sub_actual_submitted = self._execute_serial(sub_serial, cleaned=False, sub_check_point=True)
+                    conn = self._create_slave_connection()
+                    sub_snapshot = self._take_snapshot(conn)
+                    conn.close()
+
+                    # 恢复初始状态后执行sub_cleaned_serial
+                    self._restore_initial_state(temp_env_dir)
+                    sub_success, sub_rollback_ids, sub_actual_executed, sub_actual_submitted = self._execute_serial(sub_cleaned_serial, cleaned=False, sub_check_point=True)
+                    conn = self._create_slave_connection()
+                    sub_cleaned_snapshot = self._take_snapshot(conn)
+                    conn.close()
+
+                    # 获取对应的rollback to savepoint的快照
+                    last_cell = sub_serial[-1]
+                    sp_trx_id = last_cell[0]
+                    rollback_stmt = last_cell[1]
+
+                    if "ROLLBACK TO" in rollback_stmt:
+                        sp_id = rollback_stmt.strip().split()[-1]
+                        # sp_snapshot = self.sp_snapshot[sp_trx_id][sp_id]
+                    elif "ROLLBACK" == rollback_stmt or "ROLLBACK --" in rollback_stmt:
+                        # sp_snapshot = self.rollback_snapshot[sp_trx_id]
+                        pass
+                    else:
+                        logger.error(f"最后一个语句不是ROLLBACK TO或ROLLBACK: {rollback_stmt}")
+                        raise
+
+                    # 比较sub_cleaned_snapshot和sp_snapshot
+                    # if not self._compare_snapshots(sub_cleaned_snapshot, sp_snapshot):
+                    if not self._compare_snapshots(sub_snapshot, sub_cleaned_snapshot):
+                        # 增加更多详细信息，包括是哪个子检查点，以及相关SQL
+                        sub_violation_info = (
+                            f"{idx}违反原子性：{sp_trx_id}:{sp_id}\n"
+                            f"Savepoint {sp_id}\n"
+                            f"原始子序列执行状态: {sub_snapshot}\n"
+                            f"清理后子序列执行状态: {sub_cleaned_snapshot}\n"
+                            f"子检查点事务ID: {sp_trx_id}, Savepoint ID: {sp_id}\n"
+                            f"执行到的位置: 第{len(sub_serial)}条语句, 清理后位置: 第{len(sub_cleaned_serial)}条语句\n"
+                            f"原始子序列: {sub_serial}\n"
+                            f"清理后子序列: {sub_cleaned_serial}\n\n"
+                        )
+                        error_msg += f"子检查点{sub_violation_info}"
+                        res = False
+                        logger.error(f"子检查点{idx}违反原子性")
+                        logger.error(f"子检查点事务ID: {sp_trx_id}, Savepoint ID: {sp_id}")
+                        logger.error(f"子序列对：[0,{len(sub_serial)}], 清理后位置: [0,{len(sub_cleaned_serial)}]")
+
+                # 根据整体检查结果返回
+                return res, error_msg, self.executed_serial, cleaned_serial, actual_submitted_serial
+        finally:
+            # 如果使用的是临时目录且不是bug_case_dir，则删除它
+            if temp_env_dir is not None and os.path.exists(temp_env_dir):
+                self._restore_initial_state(temp_env_dir)
+                import shutil
+                try:
+                    shutil.rmtree(temp_env_dir)
+                    logger.info(f"临时导出目录已删除: {temp_env_dir}")
+                except Exception as e:
+                    logger.warning(f"删除临时导出目录失败: {e}")
 
     def _create_connection(self):
         """创建数据库连接"""
@@ -862,9 +1139,19 @@ class AtomicityChecker:
                 elif stmt.strip().upper() == "COMMIT":
                     cursor.execute("COMMIT")
                 else:
-                    cursor.execute(stmt)
-                    if stmt.strip().upper().startswith("SELECT"):
-                        cursor.fetchall()
+                    # 检查是否为存储过程调用
+                    if stmt.strip().upper().startswith("CALL"):
+                        # 第一步：执行存储过程调用
+                        cursor.execute(stmt)
+                        # 第二步：如果有结果集，获取结果
+                        if cursor.with_rows:
+                            results = cursor.fetchall()
+                            # 可以将结果保存或处理
+                    else:
+                        # 其他语句正常执行
+                        cursor.execute(stmt)
+                        if stmt.strip().upper().startswith("SELECT"):
+                            cursor.fetchall()
             cursor.close()
             return True
         except Exception as e:
@@ -875,99 +1162,13 @@ class AtomicityChecker:
                 pass
             return False
 
-    def _restore_initial_state(self):
-        """彻底恢复数据库到初始状态，包括重建表结构和重置自增序列"""
+    def _restore_initial_state(self, bug_case_dir: str):
+        """使用导出的 SQL 文件恢复数据库到初始状态"""
         try:
-            # 首先确保所有已有连接都被清理
-            self._cleanup_all_connections()
-            
-            # 创建新连接
-            new_conn = mysql.connector.connect(**self.db_config)
-            cursor = new_conn.cursor()
-            
-            # # 设置更短的超时时间
-            # cursor.execute("SET SESSION innodb_lock_wait_timeout = 3")
-            # cursor.execute("SET SESSION wait_timeout = 5")
-            
-            # 强制结束所有活跃事务
-            cursor.execute("""
-                SELECT trx_id, trx_mysql_thread_id 
-                FROM information_schema.innodb_trx
-            """)
-            for trx_id, thread_id in cursor.fetchall():
-                try:
-                    cursor.execute(f"KILL {thread_id}")
-                except:
-                    pass
-                
-            # 等待一小段时间确保事务真正结束
-            time.sleep(1)
-            
-            # 获取所有表名
-            cursor.execute("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = %s
-            """, (self.db_config['database'],))
-            tables = cursor.fetchall()
-            
-            # 禁用外键检查
-            cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
-            
-            # 删除并重建每个表
-            for (table_name,) in tables:
-                try:
-                    # 先获取表的创建语句
-                    cursor.execute(f"SHOW CREATE TABLE {table_name}")
-                    _, create_stmt = cursor.fetchone()
-                    
-                    # 尝试删除表
-                    for attempt in range(3):
-                        try:
-                            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
-                            new_conn.commit()
-                            break
-                        except Exception as e:
-                            if attempt == 2:  # 最后一次尝试失败
-                                raise
-                            time.sleep(1)
-                    
-                    # 重新创建表
-                    cursor.execute(create_stmt)
-                    new_conn.commit()
-                    
-                except Exception as e:
-                    logger.error(f"处理表 {table_name} 时发生错误: {e}")
-                    raise
-            
-            # 重新启用外键检查
-            cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
-            
-            # 重新插入初始数据
-            if hasattr(self, 'snapshot_before') and self.snapshot_before:
-                for table_name, rows in self.snapshot_before.items():
-                    for row in rows:
-                        placeholders = ','.join(['%s'] * len(row))
-                        cursor.execute(
-                            f"INSERT INTO {table_name} VALUES ({placeholders})",
-                            row
-                        )
-            
-            new_conn.commit()
-            cursor.close()
-            
-            # 如果原连接还在，关闭它
-            if conn:
-                try:
-                    conn.close()
-                except:
-                    pass
-            
-            return new_conn
-            
+            os.system(f"mysql -h localhost -P {self.db_config['port']} -u {self.db_config['user']} -p{self.db_config['password']} {self.db_config['database']} < {bug_case_dir}/initial_state.sql")
+            return
         except Exception as e:
-            logger.error(f"恢复初始状态时发生错误: {e}")
-            logger.error("")
+            logger.error(f"使用 SQL 文件恢复初始状态时发生错误: {e}")
             raise
 
     def _cleanup_all_connections(self):
@@ -1097,7 +1298,7 @@ conn.close()
 
 
 # 进行实验
-num_of_runs = 1000
+num_of_runs = 2000
 logger.info("INFO TEST")
 logger.debug("DEBUG TEST")
 logger.error("ERROR TEST")
@@ -1108,11 +1309,21 @@ date_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 SAVE_DIR = f"{database_save_dir}/{isolation_level}/{date_time}"
 for i in range(num_of_runs):
     args = parse_arguments()
+
+    # num_of_tables = random.randint(1, 3)
+    num_of_tables = random.randint(1, 2)
+    num_transactions = random.randint(1, 4)
+
     # 添加日志记录
     print(f"iter: {i}") 
     logger.info(f"iter: {i}")
     logger.info("----------SETTINGS-----------")
     logger.info(f"Isolation level: {isolation_level}")
+    logger.info(f"database: {dbconfig['database']}")
+    logger.info(f"port: {dbconfig['port']}")
+    logger.info(f"user: {dbconfig['user']}")
+    logger.info(f"Num of Tables: {num_of_tables}")
+    logger.info(f"Num of Transactions: {num_transactions}")
     logger.info("-----------------------------")
     conn = None
     try:
@@ -1121,14 +1332,6 @@ for i in range(num_of_runs):
         dbconfig_no_db.pop("database")
         conn = mysql.connector.connect(**dbconfig_no_db)
         
-        # # 创建test数据库
-        # cursor = conn.cursor()
-        # cursor.execute("CREATE DATABASE IF NOT EXISTS test")
-        # cursor.close()
-        
-        # # 重新连接到test数据库
-        # conn.close()
-        # conn = mysql.connector.connect(**dbconfig)
         try:
             initializer = MySQLInitializer(
                 connection=conn,
@@ -1141,8 +1344,7 @@ for i in range(num_of_runs):
             logger.error("")
             raise
         
-        # num_of_tables = random.randint(1, 3)
-        num_of_tables = 1
+
         # 初始化数据库
         try:
             initializer.initialize_database()
@@ -1166,7 +1368,6 @@ for i in range(num_of_runs):
         try:
             # 使用 TransactionGenerator 生成事务
             tx_generator = TransactionGenerator(tables, columns, isolation_level)
-            num_transactions = random.randint(1, 4)
         except Exception as e:
             print(f"初始化事务生成器失败: {e}")
             print("")
@@ -1236,13 +1437,23 @@ for i in range(num_of_runs):
             trx_sqls, serial
         )
         
+        temp_env_dir = f"{database_save_dir}/temp_{int(time.time())}"
+        os.makedirs(temp_env_dir, exist_ok=True)
+
+        # 先导出当前数据库状态，包含触发器和存储过程，供恢复使用
+        temp_env_dump_cmd = f"mysqldump -h localhost -P {dbconfig['port']} -u {dbconfig['user']} -p{dbconfig['password']} --routines --triggers --set-gtid-purged=OFF {dbconfig['database']} > {temp_env_dir}/initial_state.sql"
+        os.system(temp_env_dump_cmd)
+        
+
         # 检查原子性
-        is_atomic, info, executed_serial, cleaned_serial, actual_submitted_serial = atomicity_checker.check_atomicity(trx_sqls, serial)
+        is_atomic, info, executed_serial, cleaned_serial, actual_submitted_serial = atomicity_checker.check_atomicity(trx_sqls, serial, temp_env_dir)
         snapshots = atomicity_checker.get_snapshots()
+        rollback_trx_id = atomicity_checker.rollback_trx_ids
         print('is_atomic:', is_atomic)
         print('info:', info)
         print('executed_serial:', executed_serial)
         print('cleaned_serial:', cleaned_serial)
+        print('rollback_trx_id:', rollback_trx_id)
         print('snapshots:', snapshots)
         print()
 
@@ -1251,19 +1462,16 @@ for i in range(num_of_runs):
         logger.info(f"executed_serial: {executed_serial}")
         logger.info(f"actual_submitted_serial: {actual_submitted_serial}")
         logger.info(f"cleaned_serial: {cleaned_serial}")
+        logger.info(f"rollback_trx_id: {rollback_trx_id}")
         logger.info(f"snapshots: {snapshots}")
         logger.info("")
 
         if not is_atomic:
-            # 创建保存bug case的目录
+            # 创建保存整体bug case的目录
             bug_case_dir = f"{SAVE_DIR}/bug_case_{bug_count}"
             bug_count += 1
             os.makedirs(bug_case_dir, exist_ok=True)
-            
-            # 导出数据库状态
-            atomicity_checker._restore_initial_state()
-            
-            dump_cmd = f"mysqldump -h localhost -P 4000 -u root -p123456 test > {bug_case_dir}/initial_state.sql"
+            dump_cmd = f"mysqldump -h localhost -P 4000 -u root -p123456 --routines --triggers --set-gtid-purged=OFF test > {bug_case_dir}/initial_state.sql"
             os.system(dump_cmd)
 
             # 保存事务和序列信息
@@ -1284,7 +1492,90 @@ for i in range(num_of_runs):
             with open(f"{bug_case_dir}/metadata.txt", 'w') as f:
                 f.write(f"Number of Transactions: {num_transactions}\n")
                 f.write(f"Bug Info: {info}\n")
+                
+                # 检查是否包含子检查点违反原子性的信息
+                if "子检查点" in info:
+                    f.write(f"Contains Sub-Checkpoint Violations: True\n")
+                else:
+                    f.write(f"Contains Sub-Checkpoint Violations: False\n")
+                    
                 f.write(f"Snapshots: {snapshots}\n")
+            
+            # 如果有子检查点违反原子性的情况，单独保存子检查点信息
+            if "子检查点" in info:
+                # 提取子检查点相关信息
+                sub_checkpoint_sections = info.split("子检查点")
+                for i, section in enumerate(sub_checkpoint_sections):
+                    if i == 0:  # 跳过第一部分(整体违反信息)
+                        continue
+                    
+                    # 为每个子检查点创建单独的目录
+                    sub_bug_case_dir = f"{SAVE_DIR}/bug_case_{bug_count}_subcheckpoint_{i}"
+                    os.makedirs(sub_bug_case_dir, exist_ok=True)
+                    
+                    # 导出数据库状态（子检查点对应的状态）
+                    try:
+                        # 恢复初始状态
+                        atomicity_checker._restore_initial_state(bug_case_dir)
+                        
+                        # # 导出初始状态
+                        # sub_dump_cmd = f"mysqldump -h localhost -P 4000 -u root -p123456 --routines --triggers --set-gtid-purged=OFF test > {sub_bug_case_dir}/initial_state.sql"
+                        # os.system(sub_dump_cmd)
+                    except Exception as e:
+                        logger.error(f"导出子检查点{i}数据库状态时出错: {e}")
+                    
+                    # 提取子检查点ID、事务ID和Savepoint ID
+                    try:
+                        checkpoint_info = section.split('：')[0]
+                        sub_idx = checkpoint_info.split('违反原子性')[0]
+                        trx_savepoint_info = checkpoint_info.split('违反原子性：')[1].split(':')
+                        sub_trx_id = trx_savepoint_info[0]
+                        sub_sp_id = trx_savepoint_info[1].split('\n')[0]
+                        
+                        # 提取原始子序列和清理后子序列
+                        sub_executed_serial_str = section.split('原始子序列: ')[1].split('\n')[0]
+                        sub_cleaned_serial_str = section.split('清理后子序列: ')[1].split('\n')[0]
+                        
+                        # 转换字符串表示为实际序列（简化处理）
+                        sub_executed_serial = eval(sub_executed_serial_str)
+                        sub_cleaned_serial = eval(sub_cleaned_serial_str)
+                        
+                        # 保存子检查点详细信息
+                        with open(f"{sub_bug_case_dir}/metadata.txt", 'w') as f:
+                            f.write(f"Sub-Checkpoint: {i}\n")
+                            f.write(f"Transaction ID: {sub_trx_id}\n")
+                            f.write(f"Savepoint ID: {sub_sp_id}\n")
+                            f.write(f"Bug Info: 子检查点{section}\n")
+                        
+                        # 保存子检查点序列
+                        with open(f"{sub_bug_case_dir}/transactions.sql", 'w') as f:
+                            f.write(f"-- Sub-Checkpoint {i}\n")
+                            f.write(f"-- Transaction ID: {sub_trx_id}\n")
+                            f.write(f"-- Savepoint ID: {sub_sp_id}\n\n")
+                            
+                            # 保存原始事务
+                            for trx_id, sqls in trx_sqls.items():
+                                f.write(f"-- Transaction {trx_id}\n")
+                                f.write("\n".join(sqls) + "\n\n")
+                            
+                            # 保存子检查点相关序列
+                            f.write(f"-- Sub-Executed Serial\n")
+                            f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in sub_executed_serial]) + "\n\n")
+                            f.write(f"-- Sub-Cleaned Serial\n")
+                            f.write("\n".join([f"-- Transaction {t[0]}: {t[1]}" for t in sub_cleaned_serial]) + "\n\n")
+                    except Exception as e:
+                        logger.error(f"处理子检查点{i}时出错: {e}")
+                        continue
+                
+                # 总合文件
+                with open(f"{bug_case_dir}/sub_checkpoint_violations.txt", 'w') as f:
+                    f.write(f"完整的错误信息：\n{info}\n\n")
+                    
+                    for i, section in enumerate(sub_checkpoint_sections):
+                        if i == 0:  # 跳过第一部分(整体违反信息)
+                            continue
+                        f.write(f"===== 子检查点违反 {i} =====\n")
+                        f.write(f"子检查点{section}\n\n")
             
             # 记录日志
             logger.error(f"BUG FOUND: {info}")
@@ -1293,6 +1584,17 @@ for i in range(num_of_runs):
             logger.info(f"Planned Serial: {serial}")
             logger.info(f"Actually Executed Serial: {executed_serial}")
             logger.info(f"Actual Submitted Serial: {actual_submitted_serial}")
+            
+            # 增加子检查点信息的日志记录
+            if "子检查点" in info:
+                logger.error("=== 子检查点违反原子性详情 ===")
+                sub_checkpoint_sections = info.split("子检查点")
+                for i, section in enumerate(sub_checkpoint_sections):
+                    if i == 0:  # 跳过第一部分(整体违反信息)
+                        continue
+                    checkpoint_info = section.split('：')[0]
+                    logger.error(f"子检查点违反 {i}: {checkpoint_info}")
+            
             logger.info(f"Snapshots: {snapshots}")
             logger.info("")
 
@@ -1302,6 +1604,34 @@ for i in range(num_of_runs):
             print(f"Planned Serial: {serial}")
             print(f"Actually Executed Serial: {executed_serial}")
             print(f"Actual Submitted Serial: {actual_submitted_serial}")
+            
+            # 添加子检查点信息打印
+            if "子检查点" in info:
+                print("\n=== 子检查点违反原子性情况 ===")
+                sub_checkpoint_sections = info.split("子检查点")
+                for i, section in enumerate(sub_checkpoint_sections):
+                    if i == 0:  # 跳过第一部分(整体违反信息)
+                        continue
+                    
+                    try:
+                        checkpoint_info = section.split('：')[0]
+                        sub_idx = checkpoint_info.split('违反原子性')[0]
+                        trx_savepoint_info = checkpoint_info.split('违反原子性：')[1].split(':')
+                        sub_trx_id = trx_savepoint_info[0]
+                        sub_sp_id = trx_savepoint_info[1].split('\n')[0]
+                        
+                        # 提取原始子序列和清理后子序列
+                        sub_executed_serial_str = section.split('原始子序列: ')[1].split('\n')[0]
+                        sub_cleaned_serial_str = section.split('清理后子序列: ')[1].split('\n')[0]
+                        
+                        print(f"子检查点 {i} - 事务ID: {sub_trx_id}, Savepoint: {sub_sp_id}")
+                        print(f"原始子序列: {sub_executed_serial_str}")
+                        print(f"清理后子序列: {sub_cleaned_serial_str}")
+                        print("")
+                    except Exception as e:
+                        print(f"处理子检查点{i}时出错: {e}")
+                        continue
+            
             print(f"Snapshots: {snapshots}")
             print("")
             continue

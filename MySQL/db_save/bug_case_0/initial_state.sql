@@ -1,0 +1,58 @@
+-- MySQL dump 10.13  Distrib 8.3.0, for Win64 (x86_64)
+--
+-- Host: localhost    Database: test
+-- ------------------------------------------------------
+-- Server version	9.1.0
+
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+/*!40101 SET @OLD_CHARACTER_SET_RESULTS=@@CHARACTER_SET_RESULTS */;
+/*!40101 SET @OLD_COLLATION_CONNECTION=@@COLLATION_CONNECTION */;
+/*!50503 SET NAMES utf8mb4 */;
+/*!40103 SET @OLD_TIME_ZONE=@@TIME_ZONE */;
+/*!40103 SET TIME_ZONE='+00:00' */;
+/*!40014 SET @OLD_UNIQUE_CHECKS=@@UNIQUE_CHECKS, UNIQUE_CHECKS=0 */;
+/*!40014 SET @OLD_FOREIGN_KEY_CHECKS=@@FOREIGN_KEY_CHECKS, FOREIGN_KEY_CHECKS=0 */;
+/*!40101 SET @OLD_SQL_MODE=@@SQL_MODE, SQL_MODE='NO_AUTO_VALUE_ON_ZERO' */;
+/*!40111 SET @OLD_SQL_NOTES=@@SQL_NOTES, SQL_NOTES=0 */;
+
+--
+-- Table structure for table `table_0`
+--
+
+DROP TABLE IF EXISTS `table_0`;
+/*!40101 SET @saved_cs_client     = @@character_set_client */;
+/*!50503 SET character_set_client = utf8mb4 */;
+CREATE TABLE `table_0` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `c0` double NOT NULL,
+  `c1` double NOT NULL,
+  `c2` float DEFAULT NULL,
+  `c3` varchar(7) NOT NULL,
+  `c4` double NOT NULL,
+  `c5` int DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `c1` (`c1`),
+  KEY `idx_0` (`c3`,`c2`,`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=11 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+/*!40101 SET character_set_client = @saved_cs_client */;
+
+--
+-- Dumping data for table `table_0`
+--
+
+LOCK TABLES `table_0` WRITE;
+/*!40000 ALTER TABLE `table_0` DISABLE KEYS */;
+INSERT INTO `table_0` VALUES (1,-64.61,-92.89,9.38,'kwzqjfq',-89.09,-1328087540),(2,75.87,9.38,-32.9,'hdwjjb',-41.23,-2055189141),(3,65.28,-57.46,63.71,'yirepqa',51.15,-220752514),(4,-16.63,-79.44,23.89,'iwo',-82.03,-2030641852),(5,-11.13,-13.22,96.5,'azxpm',57.82,-387631560),(6,-7.9,-51.59,23.88,'pougp',75.5,2080398010),(7,-55.06,81.94,27.13,'ds',56.92,1476301331);
+/*!40000 ALTER TABLE `table_0` ENABLE KEYS */;
+UNLOCK TABLES;
+/*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
+
+/*!40101 SET SQL_MODE=@OLD_SQL_MODE */;
+/*!40014 SET FOREIGN_KEY_CHECKS=@OLD_FOREIGN_KEY_CHECKS */;
+/*!40014 SET UNIQUE_CHECKS=@OLD_UNIQUE_CHECKS */;
+/*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+/*!40101 SET CHARACTER_SET_RESULTS=@OLD_CHARACTER_SET_RESULTS */;
+/*!40101 SET COLLATION_CONNECTION=@OLD_COLLATION_CONNECTION */;
+/*!40111 SET SQL_NOTES=@OLD_SQL_NOTES */;
+
+-- Dump completed on 2025-03-03 17:26:41
